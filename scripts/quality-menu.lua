@@ -1,4 +1,4 @@
--- quality-menu 4.1.1 - 2023-Oct-22
+-- quality-menu 4.2.1 - 2025-Jun-29
 -- https://github.com/christoph-heinrich/mpv-quality-menu
 --
 -- Change the stream video and audio quality on the fly.
@@ -15,15 +15,17 @@ local assdraw = require 'mp.assdraw'
 local opt = require('mp.options')
 local script_name = mp.get_script_name()
 
+local saved_ytdl_result = nil
+
+---@type { [string]: Data }
+local url_data = {}
+
 local opts = {
     --key bindings
     up_binding = 'UP WHEEL_UP',
     down_binding = 'DOWN WHEEL_DOWN',
     select_binding = 'ENTER MBTN_LEFT',
     close_menu_binding = 'ESC MBTN_RIGHT',
-
-    --youtube-dl version(could be youtube-dl or yt-dlp, or something else)
-    ytdl_ver = 'yt-dlp',
 
     --formatting / cursors
     selected_and_active     = '▶  - ',
@@ -80,9 +82,6 @@ local opts = {
     {"default" : "bestaudio/best"}
     ]
     ]],
-
-    --automatically fetch available formats when opening an url
-    fetch_on_start = true,
 
     --show the video format menu after opening an url
     start_with_menu = false,
@@ -238,7 +237,43 @@ end
 -- special thanks to reload.lua (https://github.com/4e6/mpv-reload/)
 local function reload_resume()
     local reload_duration = mp.get_property_native('duration')
-    local time_pos = mp.get_property('time-pos')
+    local time_pos = mp.get_property_number('time-pos')
+    
+    local data = url_data[mp.get_property('path')]
+    if data and (data.video_active_id or data.audio_active_id) then
+        local ytdl_result = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
+        if ytdl_result and ytdl_result.stdout then
+            local stdout = utils.parse_json(ytdl_result.stdout)
+            if stdout and stdout.formats then
+                local video_data, audio_data
+                if not data.video_active_id then data.video_active_id = "" end
+                if not data.audio_active_id then data.audio_active_id = "" end
+                for _, format in ipairs(stdout.formats) do
+                    if format.format_id == data.video_active_id then
+                        video_data = format
+                        if format.acodec and format.acodec ~= "none" then -- don't load external audio stream if video stream also has audio
+                            audio_data = nil
+                            break
+                        end
+                    elseif format.format_id == data.audio_active_id then
+                        audio_data = format
+                    end
+                end
+                if video_data or audio_data then
+                    stdout.requested_downloads = nil -- not required by ytdl_hook if requested_formats are available
+                    stdout.requested_formats = {}
+                    if video_data then
+                        table.insert(stdout.requested_formats, video_data)
+                    end
+                    if audio_data then
+                        table.insert(stdout.requested_formats, audio_data)
+                    end
+                    ytdl_result.stdout = utils.format_json(stdout)
+                    saved_ytdl_result = ytdl_result
+                end
+            end
+        end
+    end
 
     mp.command('playlist-play-index current')
 
@@ -247,9 +282,13 @@ local function reload_resume()
     -- we should provide offset from the start. Stream doesn't have fixed start.
     -- Decent choice would be to reload stream from it's current 'live' position.
     -- That's the reason we don't pass the offset when reloading streams.
-    if reload_duration and reload_duration > 0 then
+    local reload_path = mp.get_property("path")
+    if reload_duration and reload_duration > 0 and time_pos then
         local function seeker()
-            mp.commandv('seek', time_pos, 'absolute+exact')
+            local curr_pos = mp.get_property_number("time-pos") or -1
+            if math.abs(time_pos - curr_pos) > 0.5 and reload_path == mp.get_property("path") then
+                mp.commandv('seek', time_pos, 'absolute+exact')
+            end
             mp.unregister_event(seeker)
         end
 
@@ -281,15 +320,8 @@ states.audio_fetching.to_other_type = states.video_fetching
 local open_menu_state = nil
 ---@type string | nil
 local current_url = nil
----@type {[string]: table}
-local currently_fetching = {}
+---@type function | nil
 local destructor = nil
-
-local ytdl = {
-    path = opts.ytdl_ver,
-    searched = false,
-    blacklisted = {}
-}
 
 local menu_open
 local menu_close
@@ -346,9 +378,10 @@ local function process_json(json)
     local requested_audio = nil
     local requested_formats = json.requested_formats or json.requested_downloads or {}
     for _, format in ipairs(requested_formats) do
-        if is_video(format) then
+        -- preserve currently chosen tracks even if they are considered as unknown
+        if is_video(format) or (format.video_ext and format.video_ext ~= "none") or format.height then
             requested_video = format.format_id
-        elseif is_audio(format) then
+        elseif is_audio(format) or (format.audio_ext and format.audio_ext ~= "none") or format.resolution == "audio only" then
             requested_audio = format.format_id
         end
     end
@@ -516,8 +549,6 @@ local function get_url()
 end
 
 local uosc_available = false
----@type { [string]: Data }
-local url_data = {}
 
 local function uosc_set_format_counts()
     if not uosc_available then return end
@@ -526,10 +557,67 @@ local function uosc_set_format_counts()
     if data then
         mp.commandv('script-message-to', 'uosc', 'set', 'vformats', #data.video_formats)
         mp.commandv('script-message-to', 'uosc', 'set', 'aformats', #data.audio_formats)
+        
+        -- display custom uosc button only if track choice is available and show different badges depending on video quality
+        if #data.video_formats > 1 or #data.audio_formats > 1 then
+            local quality_label, badge, w, h, fps
+            for _, stream in ipairs(data.video_formats) do
+                if stream.id == data.video_active_id and stream.properties then
+                    if stream.properties.resolution then
+                        w = stream.properties.resolution:match("^%d+")
+                        h = stream.properties.resolution:match("%d+$")
+                    end
+                    if stream.properties.frame_rate then
+                        fps = stream.properties.frame_rate:match("^[%d%.]+")
+                    end
+                end
+            end
+            if w and h then
+                local short_side = math.min(tonumber(w), tonumber(h))
+                local long_side = math.max(tonumber(w), tonumber(h))
+                quality_label = short_side .. "p"
+                if fps and tonumber(fps) and tonumber(fps) > 31 then
+                    quality_label = quality_label .. math.floor(tonumber(fps) + 0.5)
+                end
+                quality_label = " (" .. quality_label .. ")"
+                if short_side >= 4320 or long_side >= 7680 then
+                    badge = "8K"
+                elseif short_side >= 2160 or long_side >= 3840 then
+                    badge = "4K"
+                elseif short_side >= 1440 or long_side >= 2560 then
+                    badge = "2K"
+                elseif short_side >= 1080 or long_side >= 1920 then
+                    badge = "HD"
+                elseif short_side >= 720 or long_side >= 1280 then
+                    badge = "HQ"
+                else
+                    badge = "SD"
+                end
+            elseif #data.video_formats > 1 then
+                badge = tostring(#data.video_formats)
+            end
+            
+            local slang = mp.get_property("slang") or ""
+            local is_rus = slang:match("rus?,") or slang:match("rus?$")
+            mp.commandv('script-message-to', 'uosc', 'set-button', 'quality-menu', utils.format_json({
+                icon = "theaters",
+                active = false,
+                badge = badge,
+                tooltip = (is_rus and 'Качество' or 'Quality') .. (quality_label and quality_label or ''),
+                command = 'script-binding ' .. script_name .. '/video_formats_toggle'
+            })..'')
+            
+            return
+        end
     else
         mp.commandv('script-message-to', 'uosc', 'set', 'vformats', 0)
         mp.commandv('script-message-to', 'uosc', 'set', 'aformats', 0)
     end
+    
+    mp.commandv('script-message-to', 'uosc', 'set-button', 'quality-menu', utils.format_json({
+        icon = '',
+        hide = true
+    })..'')
 end
 
 ---@param json string
@@ -549,109 +637,6 @@ local function process_json_string(json)
     end
 
     return process_json(json_table)
-end
-
----@param url string
-local function download_formats(url)
-    if currently_fetching[url] then return end
-
-    msg.info('fetching available formats...')
-
-    if not (ytdl.searched) then
-        local ytdl_mcd = mp.find_config_file(opts.ytdl_ver)
-        if not (ytdl_mcd == nil) then
-            msg.verbose('found ytdl at: ' .. ytdl_mcd)
-            ytdl.path = ytdl_mcd
-        end
-        ytdl.searched = true
-    end
-
-    local ytdl_format = mp.get_property('ytdl-format')
-    local raw_options = mp.get_property_native('ytdl-raw-options')
-    local command = { ytdl.path, '--no-warnings', '--no-playlist', '-J' }
-    if ytdl_format and #ytdl_format > 0 then
-        command[#command + 1] = '-f'
-        command[#command + 1] = ytdl_format
-    end
-    for param, arg in pairs(raw_options) do
-        command[#command + 1] = '--' .. param
-        if #arg > 0 then
-            command[#command + 1] = arg
-        end
-    end
-    if opts.ytdl_ver == 'yt-dlp' then command[#command + 1] = '--no-match-filter' end
-    command[#command + 1] = '--'
-    command[#command + 1] = url
-
-    msg.verbose('calling ytdl with command: ' .. table.concat(command, ' '))
-
-    --- result.status is exit status
-    --- result.error_string can be empty string, 'killed' or 'init'
-    ---@param success boolean
-    ---@param result { status: integer, stdout: string, stderr: string, error_string: string , killed_by_us: boolean }
-    ---@param error string | nil
-    local function callback(success, result, error)
-        currently_fetching[url] = nil
-        if result.killed_by_us then return end
-        if result.status < 0 or result.stdout == '' or result.error_string ~= '' then
-            osd_message('fetching formats failed...', 2)
-            msg.verbose('status:', result.status)
-            msg.verbose('reason:', result.error_string)
-            msg.verbose('stdout:', result.stdout)
-            msg.verbose('stderr:', result.stderr)
-
-            -- trim our stderr to avoid spurious newlines
-            local ytdl_err = result.stderr:gsub('^%s*(.-)%s*$', '%1')
-            msg.error(ytdl_err)
-            local err = 'ytdl failed: '
-            if result.error_string and result.error_string == 'init' then
-                err = err .. 'not found or not enough permissions'
-            elseif not result.killed_by_us then
-                err = err .. 'unexpected error occurred'
-            else
-                err = string.format('%s returned "%d"', err, result.status)
-            end
-            msg.error(err)
-            if string.find(ytdl_err, 'yt%-dl%.org/bug') then
-                -- check version
-                local version_command = {
-                    name = 'subprocess',
-                    capture_stdout = true,
-                    args = { ytdl.path, '--version' }
-                }
-                local version_string = mp.command_native(version_command).stdout
-                local year, month, day = string.match(version_string, '(%d+).(%d+).(%d+)')
-
-                -- sanity check
-                if (tonumber(year) < 2000) or (tonumber(month) > 12) or
-                    (tonumber(day) > 31) then
-                    return
-                end
-                local version_ts = os.time { year = year, month = month, day = day }
-                if (os.difftime(os.time(), version_ts) > 60 * 60 * 24 * 90) then
-                    msg.warn('It appears that your ytdl version is severely out of date.')
-                end
-            end
-            return
-        end
-
-        msg.verbose('ytdl succeeded!')
-        local data = process_json_string(result.stdout)
-        url_data[url] = data
-        uosc_set_format_counts()
-
-        if not data then return end
-        if open_menu_state and open_menu_state == open_menu_state.to_fetching and url == current_url then
-            menu_open(open_menu_state)
-        end
-    end
-
-    currently_fetching[url] = mp.command_native_async({
-        name = 'subprocess',
-        args = command,
-        capture_stdout = true,
-        capture_stderr = true
-    }, callback)
 end
 
 ---Unknown format falls back on highest ranked format if possible
@@ -748,7 +733,7 @@ local function text_menu_open(formats, active_format, menu_type)
         local clip_top = math.floor(margin_top * height + 0.5)
         local clip_bottom = math.floor((1 - margin_bottom) * height + 0.5)
         local clipping_coordinates = '0,' .. clip_top .. ',' .. width .. ',' .. clip_bottom
-        ass:append('{\\rDefault\\q2\\clip(' .. clipping_coordinates .. ')}' .. opts.style_ass_tags)
+        ass:append('{\\rDefault\\an7\\q2\\clip(' .. clipping_coordinates .. ')}' .. opts.style_ass_tags)
 
         if #formats > 0 then
             for i, format in ipairs(formats) do
@@ -775,43 +760,20 @@ local function text_menu_open(formats, active_format, menu_type)
         draw_menu()
     end
 
-    local update_margins;
-    if utils.shared_script_property_set then
-        update_margins = function()
-            local shared_props = mp.get_property_native('shared-script-properties')
-            local val = shared_props['osc-margins']
-            if val then
-                -- formatted as '%f,%f,%f,%f' with left, right, top, bottom, each
-                -- value being the border size as ratio of the window size (0.0-1.0)
-                local vals = {}
-                for v in string.gmatch(val, '[^,]+') do
-                    vals[#vals + 1] = tonumber(v)
-                end
-                margin_top = vals[3] -- top
-                margin_bottom = vals[4] -- bottom
-            else
-                margin_top = 0
-                margin_bottom = 0
-            end
-            draw_menu()
+    local update_margins = function(_, val)
+        if not val then
+            val = mp.get_property_native('user-data/osc/margins')
         end
-        mp.observe_property('shared-script-properties', 'native', update_margins)
-    else
-        update_margins = function(_, val)
-            if not val then
-                val = mp.get_property_native('user-data/osc/margins')
-            end
-            if val then
-                margin_top = val.t
-                margin_bottom = val.b
-            else
-                margin_top = 0
-                margin_bottom = 0
-            end
-            draw_menu()
+        if val then
+            margin_top = val.t
+            margin_bottom = val.b
+        else
+            margin_top = 0
+            margin_bottom = 0
         end
-        mp.observe_property('user-data/osc/margins', 'native', update_margins)
+        draw_menu()
     end
+    mp.observe_property('user-data/osc/margins', 'native', update_margins)
 
     update_dimensions()
     update_margins()
@@ -1024,7 +986,7 @@ local function format_table(formats, columns, column_align_left)
         end
     end
 
-    local identical_columns = identical_for_all(formats, columns)
+    local identical_columns = #formats < 2 and {} or identical_for_all(formats, columns)
 
     local show_columns = {}
     for i, width in ipairs(column_widths) do
@@ -1057,7 +1019,7 @@ end
 ---@param columns string[]
 ---@return string[]
 local function format_csv(formats, columns)
-    local identical_props = identical_for_all(formats, columns)
+    local identical_props = #formats < 2 and {} or identical_for_all(formats, columns)
     local hints = {}
     for i, format in ipairs(formats) do
         local row = {}
@@ -1135,7 +1097,6 @@ function menu_open(menu_type)
     if not data then
         if opts.fetch_formats then
             loading_message(menu_type)
-            download_formats(current_url)
             return
         end
 
@@ -1212,12 +1173,6 @@ mp.register_event('start-file', function()
     end
 end)
 
-mp.register_event('file-loaded', function()
-    if not (opts.fetch_formats and opts.fetch_on_start) then return end
-    if not current_url or url_data[current_url] then return end
-    download_formats(current_url)
-end)
-
 -- run before ytdl_hook, which uses a priority of 10
 mp.add_hook('on_load', 9, function()
     local path = mp.get_property('path')
@@ -1226,6 +1181,10 @@ mp.add_hook('on_load', 9, function()
     local format = format_string(data.video_active_id, data.audio_active_id)
     msg.verbose('setting ytdl-format: ' .. format)
     mp.set_property('file-local-options/ytdl-format', format)
+    if saved_ytdl_result then
+        mp.set_property_native('user-data/mpv/ytdl/json-subprocess-result', saved_ytdl_result)
+        saved_ytdl_result = nil
+    end
 end)
 
 ---@param url string
@@ -1285,5 +1244,46 @@ mp.register_script_message('uosc-version', function(version)
             menu_close()
         end
     end)
+    
+    mp.observe_property('idle-active', 'bool', function(_, idle)
+        if idle then
+            mp.commandv('script-message-to', 'uosc', 'set-button', 'quality-menu', utils.format_json({
+                icon = '',
+                hide = true
+            })..'')
+        end
+    end)
 end)
 mp.commandv('script-message-to', 'uosc', 'get-version', mp.get_script_name())
+
+mp.observe_property('user-data/mpv/ytdl/json-subprocess-result', 'native', function(_, ytdl_result)
+    if not ytdl_result then
+        -- property gets deleted in on_after_end_file hook
+        return
+    end
+
+    if not current_url then
+        msg.error('current_url is nil')
+        return
+    end
+
+    local json = ytdl_result.stdout
+
+    if ytdl_result.status ~= 0 or json == '' then
+        json = nil
+        msg.error('fetching formats failed...')
+    elseif json then
+        ---@type Data | nil
+        local data = url_data[current_url]
+        if data == nil then
+            data = process_json_string(json)
+            url_data[current_url] = data
+            uosc_set_format_counts()
+        end
+        if not data then return end
+        if open_menu_state and open_menu_state == open_menu_state.to_fetching then
+            menu_open(open_menu_state)
+        end
+    end
+
+end)

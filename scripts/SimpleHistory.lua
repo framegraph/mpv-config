@@ -2,7 +2,7 @@
 -- License: BSD 2-Clause License
 -- Creator: Eisa AlAwadhi
 -- Project: SimpleHistory
--- Version: 1.1.6
+-- Version: 1.1.6 (modified by SearchDownload)
 
 local o = {
 ---------------------------USER CUSTOMIZATION SETTINGS---------------------------
@@ -285,7 +285,10 @@ end
 mp.set_property('user-data/simplehistory/menu-open', 'no')
 
 if string.lower(o.log_path) == '/:dir%mpvconf%' then
-	o.log_path = mp.find_config_file('.')
+    o.log_path = utils.split_path(mp.command_native({'expand-path', '~~/' .. o.log_file}) or '.')
+    if not o.log_path or o.log_path == '.' then
+        o.log_path = mp.find_config_file('.')
+    end
 elseif string.lower(o.log_path) == '/:dir%script%' then
 	o.log_path = debug.getinfo(1).source:match('@?(.*/)')
 elseif o.log_path:match('/:var%%(.*)%%') then
@@ -326,6 +329,7 @@ local filterName = 'all'
 local sortName
 local current_playlist = ""
 local full_list_contents = {}
+local file_before_playlist, last_opened_file
 
 function starts_protocol(tab, val)
 	for index, value in ipairs(tab) do
@@ -913,8 +917,16 @@ function draw_list()
 			p = list_contents[#list_contents - i].found_name or list_contents[#list_contents - i].found_path or ""
 		end
 		
-		if o.slice_longfilenames and p:len() > o.slice_longfilenames_amount then
-			p = p:sub(1, o.slice_longfilenames_amount) .. "..."
+		if o.slice_longfilenames then -- обрезка названий строго по целым юникод-символам
+            local ulen, curchar = 0, 0
+            for uchar in string.gmatch(p, "([%z\1-\127\194-\244][\128-\191]*)") do
+                if curchar > o.slice_longfilenames_amount then
+                    p = p:sub(1, ulen) .. "..."
+                    break
+                end
+                ulen = ulen + #uchar
+                curchar = curchar + 1
+            end
 		end
 		
 		if o.quickselect_0to9_keybind and o.list_show_amount <= 10 and o.quickselect_0to9_pre_text then
@@ -1734,6 +1746,7 @@ function list_close_and_trash_collection()
 	end
 	mp.set_property('user-data/simplehistory/menu-open', 'no')
 	if o.toggle_idlescreen then mp.commandv('script-message', 'osc-idlescreen', 'yes', 'no_osd') end
+    search_active = false
 	unbind_list_keys()
 	unbind_search_keys()
 	mp.set_osd_ass(0, 0, "")
@@ -1743,7 +1756,6 @@ function list_close_and_trash_collection()
 	filterName = 'all'
 	list_pages = {}
 	search_string = ''
-	search_active = false
 	list_highlight_cursor = {}
 	sortName = nil
     full_list_contents = {}
@@ -1797,35 +1809,20 @@ function list_search_activate()
 	update_search_results('','')
 	bind_search_keys()
 end
----Get byte count of utf-8 character at index i in str
-local function utf8_char_bytes(str, i)
-	local char_byte = str:byte(i)
-	local max_bytes = #str - i + 1
-	if char_byte < 0xC0 then
-		return math.min(max_bytes, 1)
-	elseif char_byte < 0xE0 then
-		return math.min(max_bytes, 2)
-	elseif char_byte < 0xF0 then
-		return math.min(max_bytes, 3)
-	elseif char_byte < 0xF8 then
-		return math.min(max_bytes, 4)
-	else
-		return math.min(max_bytes, 1)
-	end
-end
+
+local utf8_char_pattern = "[%z\1-\127\194-\244][\128-\191]*" -- взят из http://lua-users.org/wiki/LuaUnicode
 function update_search_results(character, action)
     if action == 'string_del' and #search_string == 0 then return end
     
 	if not character then character = '' end
-	if action == 'string_del' and #search_string > 0 then
+	if action == 'string_del' then
         --проклятый lua без нормальной поддержки юникода с длиной строки в количество байт текста (русские буквы длиной 2, ASCII-символы - 1)
-        --а ещё здесь функция для изменения регистра букв на нижний не работает для кириллицы!
-        local last_sym_bytes = utf8_char_bytes(search_string, math.max(#search_string-1, 1)) 
-		search_string = search_string:sub(1, -1-last_sym_bytes) 
+        --а ещё здесь функция для изменения регистра букв на нижний не работает для кириллицы!  (обе эти проблемы в итоге удалось исправить)
+		search_string = search_string:gsub(utf8_char_pattern.."$", "", 1) 
 	end
 	search_string = search_string..character
 	local prev_contents_length = #list_contents
-    if not (action ~= 'string_del' and #search_string > 0 and #list_contents == 0) then
+    if not (action ~= 'string_del' and character ~= '' and #search_string > 0 and #list_contents == 0) then
         get_list_contents(filterName)
     end
 	
@@ -1853,7 +1850,7 @@ end
 function bind_search_keys()
     mp.add_forced_key_binding("ANY_UNICODE", "handle_input", handle_input, { complex = true })
 	mp.add_forced_key_binding('BS', 'search_string_del', function() update_search_results('', 'string_del') end, 'repeatable')
-	mp.add_forced_key_binding('Ctrl+BS', 'search_word_del', function() search_string = search_string:gsub('%s+$', ''):gsub('[^%s]+$', '') update_search_results('','') end)
+	mp.add_forced_key_binding('Ctrl+BS', 'search_word_del', function() search_string = search_string:gsub('%s+$', ''):gsub('[^%s]+$', '') update_search_results('','') end, 'repeatable')
     
     bind_keys(o.list_close_keybind, 'search_exit', function() list_search_exit() end)
 	bind_keys(o.list_search_not_typing_mode_keybind, 'search_string_not_typing', function()list_search_not_typing_mode(false) end)
@@ -2005,7 +2002,7 @@ function create_backup()
 
         -- если файл бэкапа не существует, пишем бэкап сразу в этот файл
         -- такое может быть в двух случаях:
-        -- 1) при создании резервной копии впервые (случается лишь 1 раз)
+        -- 1) при создании резервной копии впервые (случается лишь 1 раз при новой установке скрипта)
         -- 2) если плеер вылетел во время между записью во временный файл бэкапа и перемещением его в основной файл (тогда целый бэкап можно извлечь из временного файла)
         if not file_info then
             local f, err = io.open(backup_path, "w")
@@ -2183,6 +2180,9 @@ function history_load_last()
 	end
 end
 
+mp.register_event('start-file', function()
+    last_opened_file = mp.get_property('path')
+end)
 mp.register_event('file-loaded', function()
 	list_close_and_trash_collection()
 	filePath, fileTitle, fileLength = get_file()
@@ -2190,25 +2190,30 @@ mp.register_event('file-loaded', function()
 	if (resume_selected == true and seekTime > 0) then
 		mp.commandv('seek', seekTime, 'absolute', 'exact')
 		resume_selected = false
-	end
-	history_resume_option() --1.1.4# remove timeout, cant remember why I put it in first place
+	else
+        history_resume_option() --1.1.4# remove timeout, cant remember why I put it in first place
+    end
 	mark_chapter()
 	if not incognito_mode then
 		history_fileonly_save()
 		autosaved_entry = true
 	end
+    file_before_playlist = nil
 end)
 
 mp.add_hook('on_unload', 9, function()--1.1.3# get the LogTime only when using on_unload because big functions do not run fully in here
 	logTime = (mp.get_property_number('time-pos') or 0)
 end)
-mp.register_event('end-file', function()--1.1.3# use end-file instead so that it doesn't cause crash while seeking ( i am able to run big functions here)
+mp.register_event('end-file', function(info)--1.1.3# use end-file instead so that it doesn't cause crash while seeking ( i am able to run big functions here)
 	if not incognito_mode then
         -- удаляем автосохранённую запись вместе с записями-дубликатами, чтобы не считывать и перезаписывать лог дважды
 		history_save(logTime, autosaved_entry) --1.1.3# get the updated time from on_unload since it will still be preserved
 	end
 	autosaved_entry = false
 	logTime = 0 --1.1.3# reset logTime to 0
+    if not (info and info.reason == "redirect") and not (file_before_playlist ~= nil and last_opened_file == file_before_playlist) then
+        resume_selected = false -- не "восстанавливаем" сохранённую позицию, если переключились на другое видео (раскрытие плейлиста не в счёт) до того, как успело загрузиться выбранное
+    end
 end)
 
 mp.observe_property("idle-active", "bool", function(_, v)
@@ -2258,11 +2263,13 @@ end)
 
 function change_pl_pos(k, v)  -- восстановление номера серии при открытии плейлиста (на всякий случай - плеер со скриптом auto-save-state должен сам это запоминать)
     if v == nil or v < 2 or (file_before_playlist ~= nil and mp.get_property("path") == file_before_playlist) then return end
-    if playlist_pos == nil or mp.get_property_number("playlist-pos-1") == playlist_pos then
+    if playlist_pos == nil or mp.get_property_number("playlist-pos-1") == playlist_pos or playlist_pos > v then
         mp.unobserve_property(change_pl_pos)
         return
     end
+    
     msg.info("Playlist position was changed to saved value: " .. playlist_pos)
+    file_before_playlist = last_opened_file -- чтобы в этом случае также восстановилось сохранённая позиция просмотра
 	mp.commandv("playlist-play-index", playlist_pos-1)
 	mp.unobserve_property(change_pl_pos)
 end

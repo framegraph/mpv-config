@@ -26,10 +26,6 @@ local utils = require 'mp.utils'
 -- Determine if the platform is Windows --
 ON_WINDOWS = (package.config:sub(1,1) ~= '/')
 
--- Determine if the platform is MacOS --
--- local uname = io.popen("uname -s"):read("*l") -- THIS CHECKING OPENS A CMD POPUP FOR A MOMENT AFTER RUNNING MPV ON WINDOWS!
-ON_MAC = not ON_WINDOWS and (uname == "Mac" or uname == "Darwin")
-
 -- Some helper functions needed to parse the options --
 function isempty(v) return not v or (v == "") or (v == 0) or (type(v) == "table" and not next(v)) end
 
@@ -169,20 +165,18 @@ local thumbnailer_options = {
     spawn_first = false,
     quit_after_inactivity = 0,
     network = false,
-    audio = false,
-    hwdec = false,
+    hwdec = "no",
     direct_io = false,
     mpv_path = "mpv",
     apply_video_filters = false,
+    max_seek_frequency = 20,
+    pass_proxy = true,
     storyboard_enable = true,
     thumbnailing_threads = "auto",
     storyboard_max_thumbnail_count = 960,
     rutube_thumbnail_interval = 10,
     rutube_min_thumbnail_target = 100,
-    storyboard_upscale = false,
     recheck_storyboard_dimensions = true,
-    use_url_whitelist = true,
-    url_whitelist = "youtube.com youtu.be youtube-nocookie.com twitch.tv rutube.ru",
     prefer_ffmpeg = false,
     cache_directory = "",
     clear_cache_timeout = 3.0,
@@ -193,6 +187,9 @@ local thumbnailer_options = {
     text_alpha = 20,
     mpv_logs = true,
     mpv_keep_logs = false,
+    use_url_whitelist = true,
+    url_whitelist = "youtube.com youtu.be youtube-nocookie.com twitch.tv rutube.ru",
+    storyboard_upscale = false,
     
     -- Explicitly disable subtitles on the mpv sub-calls
     mpv_no_sub = false,
@@ -204,11 +201,7 @@ local thumbnailer_options = {
     -- Hardware decoding
     mpv_hwdec = "no",
     -- High precision seek
-    mpv_hr_seek = "yes",
-    -- Don't pass given URL to ytdl
-    remote_direct_stream = true,
-    -- Track state of currently generating thumbnails (currently is useless)
-    track_currently_generating_thumbnails = false
+    mpv_hr_seek = "yes"
 }
 
 read_options(thumbnailer_options, SCRIPT_NAME)
@@ -227,18 +220,39 @@ function skip_nil(tbl)
     return n
 end
 
-function create_thumbnail_mpv(file_path, timestamp, size, output_path, options)
-    options = options or {}
+local args_availability = {}
+function disable_builtin_scripts(args_table)
+    local additional_args = {
+        "load-scripts", "osc", "ytdl", "load-stats-overlay", "load-console", "load-commands",
+        "load-auto-profiles", "load-select", "load-context-menu", "load-positioning", "media-controls"
+    }
+    for _, arg in ipairs(additional_args) do
+        if args_availability[arg] == nil then -- mpv will not start if given arguments not supported by the used version
+            args_availability[arg] = mp.get_property(arg) ~= nil
+        end
+        if args_availability[arg] then
+            table.insert(args_table, string.format("--%s=no", arg))
+        end
+    end
+end
 
-    local ytdl_disabled = not options.enable_ytdl and (mp.get_property_native("ytdl") == false
-                                                       or thumbnailer_options.remote_direct_stream)
-
-    local header_fields_arg = nil
+function add_http_headers(args_table)
     local header_fields = mp.get_property_native("http-header-fields")
     if #header_fields > 0 then
         -- We can't escape the headers, mpv won't parse "--http-header-fields='Name: value'" properly
-        header_fields_arg = "--http-header-fields=" .. table.concat(header_fields, ",")
+        table.insert(args_table, "--http-header-fields=" .. table.concat(header_fields, ","))
     end
+    table.insert(args_table, "--user-agent=" .. mp.get_property("user-agent"))
+    table.insert(args_table, "--referrer=" .. mp.get_property("referrer"))
+    
+    local current_proxy = mp.get_property_native("stream-lavf-o")["http_proxy"] or mp.get_property("http-proxy")
+    if thumbnailer_options.pass_proxy and current_proxy and current_proxy ~= "" then
+        table.insert(args_table, "--http-proxy=" .. current_proxy)
+    end
+end
+
+function create_thumbnail_mpv(file_path, timestamp, size, output_path, options)
+    options = options or {}
 
     local profile_arg = nil
     if thumbnailer_options.mpv_profile ~= "" then
@@ -251,14 +265,7 @@ function create_thumbnail_mpv(file_path, timestamp, size, output_path, options)
         thumbnailer_options.mpv_path,
         -- Hide console output
         "--msg-level=all=no",
-
-        -- Disable ytdl
-        (ytdl_disabled and "--no-ytdl" or nil),
-        -- Pass HTTP headers from current instance
-        header_fields_arg,
-        -- Pass User-Agent and Referer - should do no harm even with ytdl active
-        "--user-agent=" .. mp.get_property_native("user-agent"),
-        "--referrer=" .. mp.get_property_native("referrer"),
+        
         -- User set hardware decoding
         "--hwdec=" .. thumbnailer_options.mpv_hwdec,
 
@@ -278,28 +285,23 @@ function create_thumbnail_mpv(file_path, timestamp, size, output_path, options)
                 and ("--vf=scale=iw*%d:ih*%d%s"):format(size.w, size.h, (size.col_corr or ""))
                 or ("--vf=scale=%d:%d%s"):format(size.w, size.h, (size.col_corr or ""))),
         
-        "--load-scripts=no",
-        "--load-stats-overlay=no",
-        "--load-osd-console=no",
-        "--load-auto-profiles=no",
-        "--osc=no",
-        
         "--vf-add=format=bgra",
         "--of=rawvideo",
         "--ovc=rawvideo",
-        ("--o=%s"):format(output_path),
-
-        "--",
-
-        file_path,
+        ("--o=%s"):format(output_path)
     }
+    disable_builtin_scripts(mpv_command)
+    add_http_headers(mpv_command)
+    table.insert(mpv_command, "--")
+    table.insert(mpv_command, file_path)
+    
     return mp.command_native{name="subprocess", args=mpv_command}
 end
 
 function create_thumbnail_ffmpeg(file_path, timestamp, size, output_path, options)
     options = options or {}
 
-    local ffmpeg_path = ON_MAC and "/opt/homebrew/bin/ffmpeg" or "ffmpeg"
+    local ffmpeg_path = ExecutableFinder:get_executable_path("ffmpeg")
 
     local ffmpeg_command = {
         ffmpeg_path,
@@ -322,6 +324,12 @@ function create_thumbnail_ffmpeg(file_path, timestamp, size, output_path, option
 
         "-y", output_path,
     }
+    local current_proxy = mp.get_property_native("stream-lavf-o")["http_proxy"] or mp.get_property("http-proxy")
+    if thumbnailer_options.pass_proxy and current_proxy and current_proxy ~= "" then
+        table.insert(ffmpeg_command, 2, "-http_proxy")
+        table.insert(ffmpeg_command, 3, current_proxy)
+    end
+    
     return mp.command_native{name="subprocess", args=ffmpeg_command}
 end
 
@@ -335,12 +343,10 @@ function check_output(ret, output_path, is_mpv)
     else
         if ret.error or ret.status ~= 0 then
             msg.error("Thumbnailing command failed!")
-            msg.error("mpv process error:", ret.error)
-            msg.error("Process stdout:", ret.stdout)
+            msg.error((is_mpv and "mpv" or "ffmpeg") .. " process error:", ret.status)
             if is_mpv and thumbnailer_options.mpv_logs then
                 msg.error("Debug log:", log_path)
             end
-
             success = false
         end
 
@@ -417,13 +423,9 @@ function do_worker_job(state_json_string, frames_json_string)
     if thumb_state.storyboard then file_duration = 0 end
     if file_duration == nil then return end
     local file_path = thumb_state.worker_input_path
-
-    if thumb_state.is_remote and not thumb_state.storyboard then
-        if (thumbnail_func == create_thumbnail_ffmpeg) then
-            msg.warn("Thumbnailing remote path, falling back on mpv.")
-        end
-        thumbnail_func = create_thumbnail_mpv
-    end
+    
+    local last_msg_time = os.clock()
+    local msg_buffer = {}
 
     local generate_thumbnail_for_index = function(thumbnail_index)
         -- Given a 1-based thumbnail index, generate a thumbnail for it based on the thumbnailer state
@@ -433,10 +435,6 @@ function do_worker_job(state_json_string, frames_json_string)
         local thumbnail_path = thumb_state.thumbnail_template:format(thumb_idx)
         -- Grab the "middle" of the thumbnail duration instead of the very start, and leave some margin in the end (ignored for storyboards)
         local timestamp = math.min(file_duration - 0.25, (thumb_idx + 0.5) * thumb_state.thumbnail_delta)
-
-        if thumbnailer_options.track_currently_generating_thumbnails then
-            mp.commandv("script-message", "mpv_thumbnail_script-progress", tostring(thumbnail_index))
-        end
 
         -- The expected size (raw BGRA image)
         local thumbnail_raw_size = (thumb_state.thumbnail_size.w * thumb_state.thumbnail_size.h * 4)
@@ -485,7 +483,7 @@ function do_worker_job(state_json_string, frames_json_string)
                         end
                         return thumb_state.thumbnail_template:format(math.floor((atlas_idx * cols * rows + idx) / div))
                     end)
-                    mp.add_timeout(1, function() os.remove(atlas_path) end)
+                    os.remove(atlas_path)
                 end
             else
                 local ret = thumbnail_func(file_path, timestamp, thumb_state.thumbnail_size, thumbnail_path, thumb_state.worker_extra)
@@ -493,13 +491,7 @@ function do_worker_job(state_json_string, frames_json_string)
             end
 
             if not success then
-                -- Killed by us, changing files, ignore
-                msg.debug("Changing files, subprocess killed")
-                return true
-            elseif not success then
-                -- Real failure
-                mp.osd_message("Thumbnailing failed, check console for details", 3.5)
-                return true
+                return (success == false), (success == nil)
             end
         else
             msg.debug("Thumbnail", thumb_idx, "already done!")
@@ -509,7 +501,7 @@ function do_worker_job(state_json_string, frames_json_string)
         -- Sometimes ffmpeg will output an empty file when seeking to a "bad" section (usually the end)
         thumbnail_file = io.open(thumbnail_path, "rb")
 
-        -- Bail if we can't read the file (it should really exist by now, we checked this in check_output!)
+        -- Regenerate if we can't read the file (it should really exist by now, we checked this in check_output!)
         if not thumbnail_file then
             msg.error("Thumbnail suddenly disappeared!")
             return true
@@ -532,26 +524,52 @@ function do_worker_job(state_json_string, frames_json_string)
         end
 
         msg.debug("Finished work on thumbnail", thumb_idx)
-        mp.commandv("script-message", "mpv_thumbnail_script-ready", tostring(thumbnail_index), thumbnail_path)
+        table.insert(msg_buffer, thumbnail_index)
+        if os.clock() - last_msg_time > 0.05 then -- workaround for "Too many events queued" errors
+            mp.commandv("script-message", "storyboard_thumbnailer-ready", utils.format_json(msg_buffer).."")
+            last_msg_time = os.clock()
+            msg_buffer = {}
+        end
     end
 
     msg.debug(("Generating %d thumbnails @ %dx%d for %q"):format(
         #thumbnail_indexes,
         thumb_state.thumbnail_size.w,
         thumb_state.thumbnail_size.h,
-        file_path or mp.get_property("path")))
+        file_path))
 
     for i, thumbnail_index in ipairs(thumbnail_indexes) do
-        local bail = generate_thumbnail_for_index(thumbnail_index)
-        if bail then return end
+        for attempt = 1, 3 do
+            local failure, bail = generate_thumbnail_for_index(thumbnail_index)
+            if bail or mp.get_property("path") ~= file_path then
+                msg.debug("Changing files, thumbnailing stopped")
+                return
+            end
+            
+            if failure then
+                if attempt < 3 then -- possibly a temporary (network etc) issue
+                    msg.info("Retrying to generate thumbnail", thumbnail_index - 1)
+                else
+                    -- Real failure
+                    msg.fatal("Thumbnailing failed, unable to generate thumbnail", thumbnail_index - 1, "after 3 attempts")
+                    mp.osd_message("Thumbnailing failed, check console for details", 3.5)
+                    return
+                end
+            else
+                break
+            end
+        end
     end
-
+    
+    if #msg_buffer > 0 then
+        mp.commandv("script-message", "storyboard_thumbnailer-ready", utils.format_json(msg_buffer).."")
+    end
 end
 
 -- Set up listeners and keybinds
 
 -- Job listener
-mp.register_script_message("mpv_thumbnail_script-job", do_worker_job)
+mp.register_script_message("storyboard_thumbnailer-job", do_worker_job)
 
 
 -- Register this worker with the master script
@@ -564,13 +582,13 @@ local register_function = function()
         register_timer:stop()
     else
         msg.debug("Announcing self to master...")
-        mp.commandv("script-message", "mpv_thumbnail_script-worker", mp.get_script_name())
+        mp.commandv("script-message", "storyboard_thumbnailer-worker", mp.get_script_name())
     end
 end
 
 register_timer = mp.add_periodic_timer(0.1, register_function)
 
-mp.register_script_message("mpv_thumbnail_script-slaved", function()
+mp.register_script_message("storyboard_thumbnailer-slaved", function()
     msg.debug("Successfully registered with master")
     register_timer:stop()
 end)

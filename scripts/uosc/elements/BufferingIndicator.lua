@@ -44,9 +44,9 @@ function BufferingIndicator:render()
 	else
 		ass:rect(0, 0, display.width, display.height, {color = bg, opacity = 1-(1-config.opacity.buffering_indicator)/2.0})
 		size = round(30 + math.min(display.width, display.height) / 8)
-	end 
+	end
 	local opacity = (Elements.menu and Elements.menu:is_alive()) and 0.3 or 0.85
-	ass:spinner(display.width / 2, display.height / 2, size, {color = fg, opacity = opacity, border = 0.5, blur = 1})
+	ass:spinner(display.width / 2, display.height / 2, size, {color = fg, opacity = opacity, border = size/200, blur = size/100})
 	if loading then
         ass:append("\n{\\alpha&HFF\\an5\\fscy" .. 330*display.height/(display.height-70)/font_scale  .. "} 1 \n{\\alpha&H33\\an5\\fscx" .. 80/font_scale .. "\\fscy" .. 80/font_scale .. "}Воспроизведение...")
     end

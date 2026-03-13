@@ -72,6 +72,8 @@ secondary_sub_state = nil
 vid_state = nil
 window_state = nil
 geometry = ""
+af_state = ""
+window_resize = mp.get_property_bool("auto-window-resize")
 skip_flag = false
 initial_skip_time = 0
 
@@ -84,14 +86,18 @@ function restoreProp(timepos,pause)
 	mp.set_property_bool("mute", mute_state)
 	mp.set_property("speed", speed_state)
 	mp.unobserve_property(foundSilence)
-	mp.command("no-osd af remove @skiptosilence")
+	mp.set_property("af", af_state)
 	mp.set_property_bool("pause", pause)	
 	if timepos then mp.set_property_number("time-pos", timepos) end
 	mp.set_property("sub-visibility", sub_state)
 	mp.set_property("secondary-sub-visibility", secondary_sub_state)	
 	timer:kill()
 	skip_flag = false
-    mp.add_timeout(0.5, function() mp.set_property("geometry", geometry) end)
+    if window_resize ~= nil then -- mpv v0.36+
+        mp.add_timeout(0.5, function() mp.set_property_bool("auto-window-resize", window_resize) end)
+    else
+        mp.add_timeout(0.5, function() mp.set_property("geometry", geometry) end)
+    end
 end
 
 function handleMinMaxDuration(timepos)
@@ -129,13 +135,18 @@ function doSkip()
 	if o.osd_msg then mp.osd_message("Finding silence... Press Pause to cancel") end
 	if math.floor(initial_skip_time) == math.floor(mp.get_property_native('duration') or 0) then return end	
 
-	local width = mp.get_property_native("osd-width")
-	local height = mp.get_property_native("osd-height")
-    geometry = mp.get_property("geometry")
-	mp.set_property_native("geometry", ("%dx%d"):format(width, height))
+    if window_resize ~= nil then -- mpv v0.36+
+        mp.set_property_bool("auto-window-resize", false)
+    else
+        local width = mp.get_property_native("osd-width")
+        local height = mp.get_property_native("osd-height")
+        geometry = mp.get_property("geometry")
+        mp.set_property_native("geometry", ("%dx%d"):format(width, height))
+    end
 	
+    af_state = mp.get_property("af")
 	mp.command(
-		"no-osd af add @skiptosilence:lavfi=[silencedetect=noise=" ..
+		"no-osd af set @skiptosilence:lavfi=[silencedetect=noise=" ..
 		o.silence_audio_level .. "dB:d=" .. o.silence_duration .. "]"
 	)
 

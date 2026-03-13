@@ -241,6 +241,7 @@ end
 function Volume:on_display() self:update_dimensions() end
 function Volume:on_prop_border() self:update_dimensions() end
 function Volume:on_prop_title_bar() self:update_dimensions() end
+function Volume:on_prop_volume_max() self:update_dimensions() end
 function Volume:on_controls_reflow() self:update_dimensions() end
 function Volume:on_options() self:update_dimensions() end
 
@@ -256,7 +257,7 @@ function Volume:render()
 
 	-- Mute button
 	local mute_rect = {ax = self.ax, ay = self.mute_ay, bx = self.bx, by = self.by}
-	cursor:zone('primary_click', mute_rect, function() mp.commandv('cycle', 'mute') end)
+	cursor:zone('primary_down', mute_rect, function() mp.commandv('cycle', 'mute') end)
 	local ass = assdraw.ass_new()
 	local width_half = (mute_rect.bx - mute_rect.ax) / 2
 	local height_half = (mute_rect.by - mute_rect.ay) / 2

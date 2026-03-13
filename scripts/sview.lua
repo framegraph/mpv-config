@@ -4,7 +4,7 @@ data = ""
 
 function slist(input, forced)
     if input == nil then data = "No shaders loaded." return end
-    local only_a4k = true
+    local only_self_explained = true
     local fileNames = {}
     local paths = {}
 	if input ~= '' then
@@ -22,9 +22,11 @@ function slist(input, forced)
 		local listString = "Shaders loaded:"
 		for i, fileName in ipairs(fileNames) do
 			listString = listString .. "\n" .. i .. ") " .. fileName
-            if fileName:find("Anime4K") == nil then only_a4k = false end
+            if fileName:find("Anime4K") == nil and fileName:find("mpv360") == nil then
+                only_self_explained = false
+            end
 		end
-        if only_a4k and not forced then
+        if only_self_explained and not forced then
             data = ""
 		else
             data = listString

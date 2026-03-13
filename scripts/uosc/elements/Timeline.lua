@@ -18,12 +18,20 @@ function Timeline:init()
 	self.progress_line_width = 0
 	self.is_hovered = false
 	self.has_thumbnail = false
+	self.heatmap = nil
 
 	self:decide_progress_size()
 	self:update_dimensions()
 
-	-- Release any dragging when file gets unloaded
-	self:register_mp_event('end-file', function() self.pressed = false end)
+	-- Load Youtube heatmap data if available
+	self:register_mp_event('file-loaded', function()
+		self.heatmap = load_youtube_heatmap()
+	end)
+	-- Release any dragging and clear heatmap when file gets unloaded
+	self:register_mp_event('end-file', function()
+		self.pressed = false
+		self.heatmap = nil
+	end)
 end
 
 function Timeline:get_visibility()
@@ -120,8 +128,10 @@ function Timeline:set_from_cursor(fast)
 end
 
 function Timeline:clear_thumbnail()
-	mp.commandv('script-message-to', 'thumbfast', 'clear')
-	self.has_thumbnail = false
+	if self.has_thumbnail then
+		mp.commandv('script-message-to', 'thumbfast', 'clear')
+		self.has_thumbnail = false
+	end
 end
 
 function Timeline:handle_cursor_down()
@@ -165,18 +175,21 @@ function Timeline:on_global_mouse_move()
 end
 
 function Timeline:render()
-	if self.size == 0 then return end
+	if self.size == 0 then
+		self:clear_thumbnail()
+		return
+	end
 
 	local size = self:get_effective_size()
 	local visibility = self:get_visibility()
 	self.is_hovered = false
 
 	if size < 1 then
-		if self.has_thumbnail then self:clear_thumbnail() end
+		self:clear_thumbnail()
 		return
 	end
 
-	if self.proximity_raw == 0 then
+	if self.proximity_raw <= 0 then
 		self.is_hovered = true
 	end
 	if visibility > 0 then
@@ -184,6 +197,21 @@ function Timeline:render()
 			self:handle_cursor_down()
 			cursor:once('primary_up', function() self:handle_cursor_up() end)
 		end)
+         -- ПКМ по шкале времени для перемотки в начало наведённой главы (как в PotPlayer и встроенном интерфейсе mpv osc.lua)
+        if #state.chapters > 0 then
+            cursor:zone('secondary_click', self, function()
+                local hovered_time = self:get_time_at_x(cursor.x) or -1
+                local chapter_start_time = -1
+                for _, chapter in ipairs(state.chapters) do -- допускается, что список глав не отсортирован
+                    if hovered_time >= chapter.time and chapter.time > chapter_start_time then
+                        chapter_start_time = chapter.time
+                    end
+				end
+                if chapter_start_time > -1 then
+                    mp.commandv('seek', chapter_start_time, 'absolute+exact')
+                end
+            end)
+        end
 		if config.timeline_step ~= 0 then
 			cursor:zone('wheel_down', self, function()
 				mp.commandv('seek', -config.timeline_step, config.timeline_step_flag)
@@ -252,7 +280,32 @@ function Timeline:render()
 	ass:draw_stop()
 
 	-- Progress
-	ass:rect(fax, fay, fbx, fby, {opacity = config.opacity.position})
+	local function draw_progress()
+		ass:rect(fax, fay, fbx, fby, {opacity = config.opacity.position})
+	end
+
+	-- Youtube heatmap
+	local function draw_heatmap()
+		if options.timeline_heatmap ~= 'no' and self.heatmap and config.opacity.heatmap > 0 and visibility > 0 then
+			local is_above = options.timeline_heatmap == 'above'
+			local height = math.min(40, size / self.size * 40)
+			local ax, ay = bax, is_above and (bay - height) or (bay + self.top_border)
+			local bx, by = bbx, is_above and bay or bby
+			local opts = {color = config.color.heatmap, opacity = config.opacity.heatmap * visibility}
+			local clip_ay = is_above and (ay - 10) or ay
+			opts.clip = string.format('\\clip(%d,%d,%d,%d)', ax, clip_ay, bx, by)
+			ass:smooth_curve(ax, ay, bx, by, self.heatmap, opts)
+		end
+	end
+
+	-- Change draw order based on 'timeline_style' to keep the heatmap visible
+	if is_line then
+		draw_heatmap()
+		draw_progress()
+	else
+		draw_progress()
+		draw_heatmap()
+	end
 
 	-- Uncached ranges
 	if state.uncached_ranges then
@@ -287,19 +340,21 @@ function Timeline:render()
 		local diamond_border = options.timeline_border and math.max(options.timeline_border, 1) or 1
 
 		if diamond_radius > 0 then
+            local chapter_markers = {}
 			local function draw_chapter(time, radius)
 				local chapter_x, chapter_y = t2x(time), fay - 1
-				ass:new_event()
-				ass:append(string.format(
+				local marker_ass = assdraw.ass_new()
+				marker_ass:append(string.format(
 					'{\\pos(0,0)\\rDefault\\an7\\blur0\\yshad0.01\\bord%f\\1c&H%s\\3c&H%s\\4c&H%s\\1a&H%X&\\3a&H00&\\4a&H00&}',
 					diamond_border, fg, bg, bg, opacity_to_alpha(config.opacity.chapters)
 				))
-				ass:draw_start()
-				ass:move_to(chapter_x - radius, chapter_y)
-				ass:line_to(chapter_x, chapter_y - radius)
-				ass:line_to(chapter_x + radius, chapter_y)
-				ass:line_to(chapter_x, chapter_y + radius)
-				ass:draw_stop()
+				marker_ass:draw_start()
+				marker_ass:move_to(chapter_x - radius, chapter_y)
+				marker_ass:line_to(chapter_x, chapter_y - radius)
+				marker_ass:line_to(chapter_x + radius, chapter_y)
+				marker_ass:line_to(chapter_x, chapter_y + radius)
+				marker_ass:draw_stop()
+                table.insert(chapter_markers, marker_ass.text)
 			end
 
 			if #state.chapters > 0 then
@@ -320,8 +375,11 @@ function Timeline:render()
 				for i, chapter in ipairs(state.chapters) do
 					if chapter ~= hovered_chapter then draw_chapter(chapter.time, diamond_radius) end
 					local circle = {point = {x = t2x(chapter.time), y = fay - 1}, r = diamond_radius_hovered}
-					if visibility > 0 then
-						cursor:zone('primary_click', circle, function()
+					if visibility > 0 and chapter == hovered_chapter then
+						cursor:zone('primary_down', circle, function()
+							mp.commandv('seek', chapter.time, 'absolute+exact')
+						end)
+                        cursor:zone('secondary_click', circle, function() -- для единообразия
 							mp.commandv('seek', chapter.time, 'absolute+exact')
 						end)
 					end
@@ -334,6 +392,9 @@ function Timeline:render()
 				else
 					timestamp_gap = tooltip_gap + round(diamond_radius)
 				end
+                
+                ass:new_event()
+                ass:append(table.concat(chapter_markers, "\n"))
 			end
 
 			-- A-B loop indicators
@@ -407,7 +468,7 @@ function Timeline:render()
 
 	-- Hovered time and chapter
 	local rendered_thumbnail = false
-	if (self.proximity_raw == 0 or self.pressed or hovered_chapter) and not Elements:v('speed', 'dragging') then
+	if (self.proximity_raw <= 0 or self.pressed or hovered_chapter) and not Elements:v('speed', 'dragging') then
 		local cursor_x = hovered_chapter and t2x(hovered_chapter.time) or cursor.x
 		local hovered_seconds = hovered_chapter and hovered_chapter.time or self:get_time_at_x(cursor.x)
 
@@ -450,7 +511,8 @@ function Timeline:render()
 				border_color = fg,
 				radius = state.radius,
 			})
-			local thumb_seconds = (state.rebase_start_time == false and state.start_time) and (hovered_seconds - state.start_time) or hovered_seconds
+			local thumb_seconds = (state.rebase_start_time == false and state.start_time) and
+				(hovered_seconds - state.start_time) or hovered_seconds
 			mp.commandv('script-message-to', 'thumbfast', 'thumb', thumb_seconds, thumb_x, thumb_y)
 			self.has_thumbnail, rendered_thumbnail = true, true
 			tooltip_anchor.ay = ay
@@ -475,7 +537,7 @@ function Timeline:render()
 	end
 
 	-- Clear thumbnail
-	if not rendered_thumbnail and self.has_thumbnail then self:clear_thumbnail() end
+	if not rendered_thumbnail then self:clear_thumbnail() end
 
 	return ass
 end

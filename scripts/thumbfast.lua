@@ -39,11 +39,10 @@ local options = {
     -- Note that network cache of the current mpv instance will not be used, as the video is reopened by thumbnailer, so thumbnailing may be slow and unreliable
     network = false,
 
-    -- Enable on audio playback
-    audio = false,
-
-    -- Enable hardware decoding
-    hwdec = false,
+    -- Parameter that thumbnailer should use for hardware decoding
+    -- If properly configured can really improve thumbnail generation speed and CPU load
+    -- See https://mpv.io/manual/master/#options-hwdec for the values. Note that only copy-back modes (auto-copy, d3d11va-copy etc) can be used
+    hwdec = "no",
 
     -- Windows only: use native Windows API to write to pipe (requires LuaJIT)
     direct_io = false,
@@ -55,11 +54,15 @@ local options = {
     -- May increase likelihood that thumbnailer will hang, as well as increase latency before the actual thumbnail is displayed
     -- To display thumbnails when using lavfi-complex filters like blur-edges, this feature must be disabled
     apply_video_filters = false,
+    
+    -- Maximum seeks per second by thumbnailer (thumbfast's default: 20)
+    max_seek_frequency = 20,
+    
+    -- Use the same proxy for network thumbnailing as for the video itself
+    pass_proxy = true,
 
     
-    ------------------------------------
-    -- Storyboard thumbnailer options --
-    ------------------------------------
+    ---- Storyboard thumbnailer options ----
 
     -- Enable storyboards (requires yt-dlp in PATH or in the same folder as mpv's executable). Currently only supports YouTube, Twitch and Rutube VoDs
     storyboard_enable = true,
@@ -75,23 +78,11 @@ local options = {
     -- as well as set a minimum target number of thumbnails to increase their density for shorter videos
     rutube_thumbnail_interval = 10,
     rutube_min_thumbnail_target = 100,
-
-    -- Most storyboard thumbnails are 160x90 or 320x180. Enabling this allows upscaling them up during processing, but it will result in wasted disk space
-    -- Since mpv v0.38, thumbnails can be scaled directly in the player, so there is no need to save enlarged thumbnails; therefore, this option will have no effect
-    storyboard_upscale = false,
     
     -- yt-dlp sometimes gives slightly incorrect storyboard dimensions, which completely breaks thumbnails
     -- This option enables rechecking storyboard dimensions by mpv to obtain accurate values
     -- This usually takes less than half a second but slows down the initialization of thumbnails for that duration
     recheck_storyboard_dimensions = true,
-    
-    -- By default, the storyboard is requested from yt-dlp only for those sites where it is known to be supported, in order to avoid unnecessary yt-dlp calls
-    -- You can disable this to try to obtain storyboards for any http(s) videos if you feel lucky
-    -- Note that for videos for which a storyboard has been requested, on-the-fly thumbnailer will not be used, even with the option network=yes
-    use_url_whitelist = true,
-
-    -- A list of website domains separated by space for which to try to obtain storyboards
-    url_whitelist = "youtube.com youtu.be youtube-nocookie.com twitch.tv rutube.ru",
     
     -- Use ffmpeg to generate thumbnails instead of mpv (requires ffmpeg in PATH)
     -- ffmpeg can be slightly faster and less resource-intense than mpv
@@ -120,8 +111,24 @@ local options = {
     -- Output debug logs to <thumbnail_path>.log, ala <cache_directory>/<video_filename>/000000.bgra.log
     -- The logs are removed after successful encodes, unless you set mpv_keep_logs below
     mpv_logs = true,
-    -- Keep all mpv logs, even the succesfull ones
-    mpv_keep_logs = false
+    -- Keep all mpv logs, even the successful ones
+    mpv_keep_logs = false,
+    
+    
+    ---- Compatibility options ----
+    
+    -- [mpv v0.38-] (since v0.39 script checks storyboards for presence using a built-in property on all websites and doesn't call yt-dlp)
+    -- By default, the storyboard is requested from yt-dlp only for those sites where it is known to be supported, in order to avoid unnecessary yt-dlp calls
+    -- You can disable this to try to obtain storyboards for any http(s) videos if you feel lucky
+    -- Note that for videos for which a storyboard has been requested, on-the-fly thumbnailer will not be used, even with the option network=yes
+    use_url_whitelist = true,
+
+    -- [mpv v0.38-] A list of website domains separated by space for which to try to obtain storyboards
+    url_whitelist = "youtube.com youtu.be youtube-nocookie.com twitch.tv rutube.ru",
+
+    -- [mpv v0.37-] Most storyboard thumbnails are 160x90 or 320x180. Enabling this allows upscaling them during processing, but it will result in wasted disk space
+    -- Since mpv v0.38, thumbnails can be scaled directly in the player, so there is no need to save enlarged thumbnails
+    storyboard_upscale = false
 }
 opt.read_options(options, "thumbfast")
 
@@ -135,12 +142,14 @@ local displaying_size_w = 0
 local displaying_size_h = 0
 local osc_thumb_state = {}
 local progress_bar = mp.create_osd_overlay("ass-events")
-local prev_thumb_count = 0
-local antistuck_attempt = 0
 local url_table = {}
 local mpv_0_38_above = false -- mpv v0.38+ with support of scaling image overlays using overlay-add
 if mp.get_property("input-commands") ~= nil then
     mpv_0_38_above = true
+end
+local mpv_0_39_above = false -- mpv v0.39+ with ability to get yt-dlp output for the current video
+if mp.get_property("autocreate-playlist") ~= nil then
+    mpv_0_39_above = true
 end
 
 -- Determine if the platform is Windows --
@@ -273,7 +282,8 @@ local Thumbnailer = {
         -- in progress: 0
         -- not ready: -1
         thumbnails = {},
-
+        
+        worker_input_path = nil,
         -- Extra options for the workers
         worker_extra = {},
 
@@ -406,7 +416,10 @@ local has_vid = 0
 local vid_off = false -- support for thumbnais when lavfi-complex filter (e.g. blur-edges) is active
 
 local file_timer = nil
-local file_check_period = 1/60
+local file_check_period = math.min(1 / 60, 1 / (options.max_seek_frequency * 2))
+
+local respawn_needed = false
+local abort_data = nil
 
 local allow_fast_seek = true
 
@@ -593,6 +606,37 @@ function get_size(width, height, pref_w, pref_h)
     return w, h
 end
 
+local args_availability = {}
+function disable_builtin_scripts(args_table)
+    local additional_args = {
+        "load-scripts", "osc", "ytdl", "load-stats-overlay", "load-console", "load-commands",
+        "load-auto-profiles", "load-select", "load-context-menu", "load-positioning", "media-controls"
+    }
+    for _, arg in ipairs(additional_args) do
+        if args_availability[arg] == nil then -- mpv will not start if given arguments not supported by the used version
+            args_availability[arg] = mp.get_property(arg) ~= nil
+        end
+        if args_availability[arg] then
+            table.insert(args_table, string.format("--%s=no", arg))
+        end
+    end
+end
+
+function add_http_headers(args_table)
+    local header_fields = mp.get_property_native("http-header-fields")
+    if #header_fields > 0 then
+        -- We can't escape the headers, mpv won't parse "--http-header-fields='Name: value'" properly
+        table.insert(args_table, "--http-header-fields=" .. table.concat(header_fields, ","))
+    end
+    table.insert(args_table, "--user-agent=" .. mp.get_property("user-agent"))
+    table.insert(args_table, "--referrer=" .. mp.get_property("referrer"))
+    
+    local current_proxy = mp.get_property_native("stream-lavf-o")["http_proxy"] or mp.get_property("http-proxy")
+    if options.pass_proxy and current_proxy and current_proxy ~= "" then
+        table.insert(args_table, "--http-proxy=" .. current_proxy)
+    end
+end
+
 local function calc_dimensions()
     local params = "video-params"
     if options.apply_video_filters then params = "video-out-params" end
@@ -611,8 +655,8 @@ local function calc_dimensions()
     end
 end
 
-function check_disabled_video() -- check for disabled video track existance and correct some properties
-    if mp.get_property_native("vid") then
+function check_disabled_video() -- check for disabled video track existance when using lavfi-complex and correct some properties
+    if mp.get_property_native("vid") or mp.get_property("lavfi-complex") == "" then
         vid_off = false
     else
         local tracks_total = mp.get_property_native("track-list/count")
@@ -632,18 +676,16 @@ local function info(w, h)
     if storyboard_requested then return end
 
     local rotate = properties["video-params"] and properties["video-params"]["rotate"]
-    local image = properties["current-tracks"] and properties["current-tracks"]["video"] and properties["current-tracks"]["video"]["image"]
-    local albumart = image and properties["current-tracks"]["video"]["albumart"]
-
     if not options.apply_video_filters then
         check_disabled_video()
     end
     
     disabled = (w or 0) == 0 or (h or 0) == 0 or
         has_vid == 0 or
-        (properties["demuxer-via-network"] and not options.network) or
-        (mp.get_property("current-tracks/video/albumart") == "yes" and not options.audio) or
-        (image and not albumart) or
+        mp.get_property_bool("seekable") == false or
+        (mp.get_property_bool("demuxer-via-network") and not options.network) or
+        mp.get_property_bool("current-tracks/video/albumart") or
+        mp.get_property_bool("current-tracks/video/image") or
         force_disabled
 
     if info_timer then
@@ -674,7 +716,7 @@ end
 local activity_timer
 
 local function spawn(time)
-    if disabled or storyboard_requested then return end
+    if disabled or storyboard_requested or not video_loaded then return end
 
     local path = properties["path"]
     if path == nil then return end
@@ -699,17 +741,21 @@ local function spawn(time)
     if vid_off then vid = 1 end
 
     local args = {
-        mpv_path, "--no-config", "--msg-level=all=no", "--idle", "--pause", "--keep-open=always", "--really-quiet", "--no-terminal",
-        "--load-scripts=no", "--osc=no", "--ytdl=no", "--load-stats-overlay=no", "--load-osd-console=no", "--load-auto-profiles=no",
+        mpv_path, "--no-config", "--msg-level=all=no,ipc=error", "--pause", "--keep-open=always", "--loop-file", "--really-quiet",
         "--edition="..(properties["edition"] or "auto"), "--vid="..(vid or "auto"), "--no-sub", "--no-audio",
         "--start="..time, allow_fast_seek and "--hr-seek=no" or "--hr-seek=yes",
         "--ytdl-format=worst", "--demuxer-readahead-secs=0", "--demuxer-max-bytes=128KiB",
-        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads=2", "--hwdec="..(options.hwdec and "auto" or "no"),
+        "--vd-lavc-skiploopfilter=all", "--vd-lavc-software-fallback=1", "--vd-lavc-fast", "--vd-lavc-threads=2", "--hwdec="..options.hwdec,
         "--vf="..vf_string(filters_all, true),
         "--sws-scaler=fast-bilinear",
         "--video-rotate="..last_rotate,
         "--ovc=rawvideo", "--of=image2", "--ofopts=update=1", "--o="..options.thumbnail
     }
+    disable_builtin_scripts(args)
+    
+    if properties["demuxer-via-network"] then
+        add_http_headers(args)
+    end
 
     if not pre_0_30_0 then
         table.insert(args, "--sws-allow-zimg=no")
@@ -745,10 +791,12 @@ local function spawn(time)
     spawned = true
     spawn_waiting = true
 
-    subprocess(args, true,
+    abort_data = subprocess(args, true,
         function(success, result)
+            msg.debug("Thumbnailer process has finished with status code", result.status)
+            spawned = false
+            abort_data = nil
             if spawn_waiting and (success == false or (result.status ~= 0 and result.status ~= -2)) then
-                spawned = false
                 spawn_waiting = false
                 options.tone_mapping = "no"
                 mp.msg.error("mpv subprocess create failed")
@@ -785,6 +833,13 @@ local function spawn(time)
                 end
                 spawn_working = true
                 spawn_waiting = false
+                if respawn_needed then
+                    if video_loaded then
+                        spawn(last_seek_time or mp.get_property_number("time-pos") or 0)
+                        file_timer:resume()
+                    end
+                    respawn_needed = nil
+                end
             end
         end
     )
@@ -885,7 +940,7 @@ local function seek(fast)
     end
 end
 
-local seek_period = 3/60
+local seek_period = 1 / options.max_seek_frequency
 local seek_period_counter = 0
 local seek_timer
 seek_timer = mp.add_periodic_timer(seek_period, function()
@@ -893,7 +948,7 @@ seek_timer = mp.add_periodic_timer(seek_period, function()
         seek(allow_fast_seek)
         seek_period_counter = 1
     else
-        if seek_period_counter == 2 then
+        if seek_period_counter == math.floor(options.max_seek_frequency / 10 + 0.5) then
             if allow_fast_seek then
                 seek_timer:kill()
                 seek()
@@ -984,7 +1039,6 @@ local function quit()
         return
     end
     run("quit")
-    spawned = false
     real_w, real_h = nil, nil
     clear()
 end
@@ -1060,11 +1114,10 @@ local function watch_changes(fully_loaded)
         if resized then
             -- mpv doesn't allow us to change output size
             local seek_time = last_seek_time
-            run("quit")
+            run("quit") -- non-instant operation
             clear()
-            spawned = false
-            spawn(seek_time or mp.get_property_number("time-pos", 0))
-            file_timer:resume()
+            real_w, real_h = nil, nil
+            respawn_needed = true -- respawn thumbnailer as soon as the previous one finishes and frees the IPC socket
         else
             if rotate ~= last_rotate then
                 run("set video-rotate "..rotate)
@@ -1143,9 +1196,7 @@ local function sync_changes(prop, val)
 end
 
 local function file_load()
-    video_loaded = true
     clear()
-    spawned = false
     real_w, real_h = nil, nil
     last_real_w, last_real_h = nil, nil
     last_tone_mapping = nil
@@ -1155,10 +1206,13 @@ local function file_load()
         info_timer = nil
     end
 
-    if not storyboard_requested then -- don't allow conflict between thumbfast and storyboard thumbnailer
-        calc_dimensions()
-        info(effective_w, effective_h)
-    end
+    mp.add_timeout(0, function() -- wait until script updates all observed properties
+        video_loaded = true
+        if not storyboard_requested then -- don't allow conflict between thumbfast and storyboard thumbnailer
+            calc_dimensions()
+            info(effective_w, effective_h)
+        end
+    end)
 end
 
 local function shutdown()
@@ -1214,41 +1268,19 @@ if options.spawn_first then
     end)
 end
 
+mp.enable_messages("error")
+mp.register_event("log-message", function(tab)
+    -- Receive IPC error messages from the thumbnailer
+    -- If the IPC socket hasn't been freed by the time thumbnailer closes, IPC connection will be lost and it will no longer be controllable
+    -- In that case thumbnailer must be restarted
+    if tab.prefix == "thumbfast" and tab.text:find("Couldn't create first pipe instance") and spawned and abort_data then
+        msg.info("Terminating uncontrollable thumbnailer")
+        mp.abort_async_command(abort_data)
+    end
+end)
+
 mp.register_idle(watch_changes)
 
-
-
-local check_generation_progress = mp.add_periodic_timer(3, function()
-    local thumbs_ready = Thumbnailer.state.finished_thumbnails
-    local thumbs_total = Thumbnailer.state.thumbnail_count
-    if thumbs_ready == thumbs_total or not Thumbnailer.state.enabled then
-        stop_checking()
-        return
-    end
-    
-    if thumbs_ready == prev_thumb_count then
-        if antistuck_attempt < 3 then
-            antistuck_attempt = antistuck_attempt + 1
-            msg.warn("Thumbnailing process was stuck, restarting")
-            Thumbnailer:start_worker_jobs()
-        else
-            local err = "Thumbnailing process was stuck, giving up after 3 retries"
-            msg.error(err)
-            mp.osd_message(err)
-            stop_checking()
-        end
-    else
-        antistuck_attempt = 0
-    end
-    prev_thumb_count = thumbs_ready
-end)
-check_generation_progress:kill()
-
-function stop_checking()
-    if check_generation_progress:is_enabled() then check_generation_progress:kill() end
-    prev_thumb_count = 0
-    antistuck_attempt = 0
-end
 
 local recently_updated = false
 function request_update_thumbnail()
@@ -1257,7 +1289,7 @@ function request_update_thumbnail()
         recently_updated = true -- don't update too often
         osc_thumb_state.visible = false -- forcefully update the thumbnail in the same position
         display_storyboard_thumbnail(osc_thumb_state.last_time, osc_thumb_state.last_x, osc_thumb_state.last_y)
-        mp.add_timeout(0.1, function() recently_updated = false end)
+        mp.add_timeout(0.05, function() recently_updated = false end)
     end
 end
 
@@ -1273,8 +1305,10 @@ function Thumbnailer:clear_state()
     storyboard_requested = false
 end
 
-function Thumbnailer:on_thumb_ready(index)
-    self.state.thumbnails[index] = 1
+function Thumbnailer:on_thumbs_ready(indexes)
+    for _, index in ipairs(indexes) do
+        self.state.thumbnails[index] = 1
+    end
 
     -- Full recount instead of a naive increment (let's be safe!)
     self.state.finished_thumbnails = 0
@@ -1286,17 +1320,12 @@ function Thumbnailer:on_thumb_ready(index)
     request_update_thumbnail()
 end
 
-function Thumbnailer:on_thumb_progress(index)
-    self.state.thumbnails[index] = (self.state.thumbnails[index] == 1) and 1 or 0
-    request_update_thumbnail()
-end
-
 function Thumbnailer:on_start_file()
     -- Clear state when a new file is being loaded
     self:clear_state()
     
     local path = mp.get_property("path")
-    if path and path:find("^https?://") and not self.state.ready and options.storyboard_enable then
+    if not mpv_0_39_above and path and path:find("^https?://") and not self.state.ready and options.storyboard_enable then
         if options.use_url_whitelist then
             local domain = path:match("https?://([^/]+)") or ""
             while domain:find("%.") do -- check both domains and subdomains for existance in the list
@@ -1312,31 +1341,69 @@ function Thumbnailer:on_start_file()
     end
 end
 
-function Thumbnailer:request_storyboard(initial_path)
+function Thumbnailer:check_ytdl_json()
+    local ytdl_result = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result") or {}
+    if ytdl_result.stdout then
+        local data = utils.parse_json(ytdl_result.stdout)
+        if data and data.formats then
+            local sb = nil
+            for _, format in ipairs(data.formats) do
+                -- looking for storyboard format with best resolution available
+                if format.format_note == "storyboard" and format.width and format.height then
+                    if not sb or format.width > sb.width or format.height > sb.height then
+                        sb = format
+                    end
+                end
+            end
+            if sb then
+                local mpv_duration = mp.get_property_number("duration") or 0
+                sb.duration = (mpv_duration > 1) and mpv_duration or data.duration
+                sb.extractor = data.extractor
+                return sb
+            end
+        end
+    end
+end
+
+function Thumbnailer:request_storyboard(initial_path, from_ytdl_json)
     local function on_success()
-        if mp.get_property("path") == initial_path and self.state.available then
+        if mp.get_property("path") == initial_path and self.state.available and not spawned then
+            self.state.worker_input_path = initial_path
             self.state.thumbnail_template, self.state.thumbnail_directory = self:get_thumbnail_template()
             self:start_worker_jobs()
         end
     end
     
-    msg.info("Trying to get storyboard info...")
-    storyboard_requested = true
+    if not from_ytdl_json then
+        msg.info("Trying to get storyboard info...")
+    end
     local json, err = utils.format_json({width=0, height=0, disabled=true, available=false, socket=options.socket, thumbnail=options.thumbnail, overlay_id=options.overlay_id})
     mp.command_native({"script-message", "thumbfast-info", json}) -- disable availability of the thumbnailer until we get storyboard data
     self.state.ready = true
     if not initial_path:find("https?://[^/]*rutube%.ru") then
-        self:check_storyboard_async(on_success)
+        if not from_ytdl_json then
+            storyboard_requested = true
+            self:check_storyboard_async(on_success)
+        else
+            local sb_data = self:check_ytdl_json()
+            if sb_data and self:process_storyboard_data(sb_data) then
+                storyboard_requested = true
+                on_success()
+            else
+                msg.verbose("Storyboard data not found for " .. initial_path)
+            end
+        end
     else
         -- yt-dlp does not support extracting storyboards for Rutube
         -- however, we can obtain all the necessary data, knowing only the direct stream link and video duration
         local function on_loaded()
-            if mp.get_property("path") == initial_path and mp.get_property("duration") then
+            if mp.get_property("path") == initial_path and mp.get_property("duration") and not self.state.enabled then
                 self:check_rutube_storyboard(on_success)
             end
             mp.unregister_event(on_loaded)
         end
         
+        storyboard_requested = true
         if mp.get_property("duration") then
             self:check_rutube_storyboard(on_success) -- video has already finished loading
         else
@@ -1347,26 +1414,119 @@ end
 
 function Thumbnailer:obtain_dimensions(url)
     msg.debug("Obtaining accurate dimensions of " .. url .. " using mpv")
-    local mpv_args = {
-        options.mpv_path, "--no-config", "--video=no", "--audio=no",
-        "--user-agent=" .. mp.get_property_native("user-agent"),
-        "--referrer=" .. mp.get_property_native("referrer"),
-        "--", url
-    }
+    local mpv_args = { options.mpv_path, "--no-config", "--video=no", "--audio=no" }
+    disable_builtin_scripts(mpv_args)
+    add_http_headers(mpv_args)
+    table.insert(mpv_args, "--")
+    table.insert(mpv_args, url)
+
     local res = mp.command_native({
         name = "subprocess",
         args = mpv_args,
         capture_stdout = true,
         capture_stderr = true
     })
-    local dimensions = res.stdout:lower():match("%-%-vid=1%s+%(%w+%s+(%d+x%d+)")
+    local dimensions = res.stdout:lower():match("%-%-vid=1 [^\r\n]*%([^\r\n]* (%d+x%d+)")
     if dimensions then
         local width = tonumber(dimensions:match("(%d+)x"))
         local height = tonumber(dimensions:match("x(%d+)"))
         msg.debug("Received dimensions: " .. width .. "x" .. height .. " from output:\n" .. res.stdout)
         return width, height
+    elseif res.killed_by_us then
+        return -1, -1
     else
         msg.verbose("Failed to get dimensions of " .. url .. "\nstdout: " .. res.stdout .. "\nstderr:" .. res.stderr) -- error will be logged separately
+    end
+end
+
+function Thumbnailer:process_storyboard_data(sb) -- returns true on success
+    if sb and sb.duration and sb.width and sb.height and sb.fragments and #sb.fragments > 0 then
+        self.state.storyboard = {}
+        self.state.storyboard.fragments = sb.fragments
+        self.state.storyboard.fragment_base_url = sb.fragment_base_url
+        self.state.storyboard.rows = sb.rows or 5
+        self.state.storyboard.cols = sb.columns or 5
+        
+        if options.recheck_storyboard_dimensions then
+            -- yt-dlp sometimes gives slightly incorrect storyboard width with a 1-pixel error, which completely breaks thumbnails
+            -- Examples of "problematic" videos:
+            -- https://www.youtube.com/watch?v=ntpgDg3O6h8 (159 instead of 160)
+            -- https://www.youtube.com/watch?v=DF6W1XD25Dc (120 instead of 119)
+            local sb_w, sb_h = self:obtain_dimensions(sb.fragments[1].url)
+            if sb_w and sb_h then
+                if sb_w == -1 then return end -- video has changed during obtaining
+                
+                if sb_w % sb.columns == 0 and sb_h % sb.rows == 0 then
+                    local actual_w = sb_w / sb.columns
+                    local actual_h = sb_h / sb.rows
+                    if sb.width - actual_w ~= 0 or sb.height - actual_h ~= 0 then
+                        msg.info(string.format("Storyboard dimensions was fixed from %dx%d to %dx%d", sb.width, sb.height, actual_w, actual_h))
+                    end
+                    sb.width = actual_w
+                    sb.heigth = actual_h
+                else
+                    msg.warn("Actual storyboard dimensions is not divisible by count of thumbnails for each dimension! Thumbnails might be broken")
+                end
+            else
+                msg.warn("Unable to get actual storyboard dimensions, using approximate data by yt-dlp")
+            end
+        end
+
+        if sb.fps then
+            self.state.thumbnail_count = math.floor(sb.fps * sb.duration + 0.5) -- round
+            -- hack: youtube always adds 1 black frame at the end...
+            if sb.extractor == "youtube" then
+                self.state.thumbnail_count = self.state.thumbnail_count - 1
+            end
+        else
+            -- estimate the count of thumbnails
+            -- assume first atlas is always full
+            self.state.thumbnail_delta = sb.fragments[1].duration / (self.state.storyboard.rows*self.state.storyboard.cols)
+            self.state.thumbnail_count = math.floor(sb.duration / self.state.thumbnail_delta)
+        end
+        self.state.original_count = self.state.thumbnail_count
+
+        -- Storyboard upscaling factor
+        local scale = 1
+        local w, h = get_size(sb.width, sb.height, options.max_width, options.max_height)
+        if self.state.storyboard.rows > 1 or self.state.storyboard.cols > 1 then
+            if options.storyboard_upscale and not mpv_0_38_above then
+                -- BUG: sometimes mpv crashes when asked for non-integer scaling and BGRA format (something related to zimg?)
+                -- use integer scaling for now
+                scale = math.max(1, math.floor(h / sb.height))
+            end
+            self.state.thumbnail_size = {w=sb.width*scale, h=sb.height*scale}
+        else
+            if h > sb.height and options.storyboard_upscale and not mpv_0_38_above then
+                scale = math.max(1, h / sb.height)
+            elseif h < sb.height then
+                scale = math.max(0.1, h / sb.height)
+            end
+            self.state.thumbnail_size = {w=math.floor(sb.width*scale+0.5), h=math.floor(sb.height*scale+0.5)}
+        end
+        self.state.storyboard.scale = scale
+
+        local divisor = 1 -- only save every n-th thumbnail
+        if options.storyboard_max_thumbnail_count then
+            divisor = math.ceil(self.state.thumbnail_count / options.storyboard_max_thumbnail_count)
+        end
+        self.state.storyboard.divisor = divisor
+        self.state.thumbnail_count = math.floor(self.state.thumbnail_count / divisor)
+        self.state.thumbnail_delta = sb.duration / self.state.thumbnail_count
+        if sb.extractor == "youtube" and self.state.thumbnail_delta > 1 then
+            -- yt-dlp doesn't provide seconds between thumbnails, but Youtube apparently uses integer deltas only
+            self.state.thumbnail_delta = math.floor(self.state.thumbnail_delta + 0.5)
+        end
+
+        -- Prefill individual thumbnail states
+        self.state.thumbnails = {}
+        for i = 1, self.state.thumbnail_count do
+            self.state.thumbnails[i] = -1
+        end
+
+        msg.info(string.format("Storyboard info acquired! Using %d of %d thumbnails sized %dx%d", self.state.thumbnail_count, self.state.original_count, sb.width, sb.height))
+        self.state.available = true
+        return true
     end
 end
 
@@ -1390,86 +1550,7 @@ function Thumbnailer:check_storyboard_async(callback)
     mp.command_native_async({name="subprocess", args=sb_cmd, capture_stdout=true}, function(success, sb_json)
         if success and sb_json.status == 0 then
             local sb = utils.parse_json(sb_json.stdout)
-            if sb and sb.duration and sb.width and sb.height and sb.fragments and #sb.fragments > 0 then
-                self.state.storyboard = {}
-                self.state.storyboard.fragments = sb.fragments
-                self.state.storyboard.fragment_base_url = sb.fragment_base_url
-                self.state.storyboard.rows = sb.rows or 5
-                self.state.storyboard.cols = sb.columns or 5
-                
-                if options.recheck_storyboard_dimensions then
-                    -- yt-dlp sometimes gives slightly incorrect storyboard width with a 1-pixel error, which completely breaks thumbnails
-                    -- Examples of "problematic" videos:
-                    -- https://www.youtube.com/watch?v=ntpgDg3O6h8 (159 instead of 160)
-                    -- https://www.youtube.com/watch?v=DF6W1XD25Dc (120 instead of 119)
-                    local sb_w, sb_h = self:obtain_dimensions(sb.fragments[1].url)
-                    if sb_w and sb_h then
-                        if sb_w % sb.rows == 0 and sb_h % sb.columns == 0 then
-                            local actual_w = sb_w / sb.columns
-                            local actual_h = sb_h / sb.rows
-                            if sb.width - actual_w ~= 0 or sb.height - actual_h ~= 0 then
-                                msg.info(string.format("Storyboard dimensions was fixed from %dx%d to %dx%d", sb.width, sb.height, actual_w, actual_h))
-                            end
-                            sb.width = actual_w
-                            sb.heigth = actual_h
-                        else
-                            msg.warn("Actual storyboard dimensions is not divisible by count of thumbnails for each dimension! Thumbnails might be broken")
-                        end
-                    else
-                        msg.warn("Unable to get actual storyboard dimensions, using approximate data by yt-dlp")
-                    end
-                end
-
-                if sb.fps then
-                    self.state.thumbnail_count = math.floor(sb.fps * sb.duration + 0.5) -- round
-                    -- hack: youtube always adds 1 black frame at the end...
-                    if sb.extractor == "youtube" then
-                        self.state.thumbnail_count = self.state.thumbnail_count - 1
-                    end
-                else
-                    -- estimate the count of thumbnails
-                    -- assume first atlas is always full
-                    self.state.thumbnail_delta = sb.fragments[1].duration / (self.state.storyboard.rows*self.state.storyboard.cols)
-                    self.state.thumbnail_count = math.floor(sb.duration / self.state.thumbnail_delta)
-                end
-                self.state.original_count = self.state.thumbnail_count
-
-                -- Storyboard upscaling factor
-                local scale = 1
-                local w, h = get_size(sb.width, sb.height, options.max_width, options.max_height)
-                if self.state.storyboard.rows > 1 or self.state.storyboard.cols > 1 then
-                    if options.storyboard_upscale and not mpv_0_38_above then
-                        -- BUG: sometimes mpv crashes when asked for non-integer scaling and BGRA format (something related to zimg?)
-                        -- use integer scaling for now
-                        scale = math.max(1, math.floor(h / sb.height))
-                    end
-                    self.state.thumbnail_size = {w=sb.width*scale, h=sb.height*scale}
-                else
-                    if h > sb.height and options.storyboard_upscale and not mpv_0_38_above then
-                        scale = math.max(1, h / sb.height)
-                    elseif h < sb.height then
-                        scale = math.max(0.1, h / sb.height)
-                    end
-                    self.state.thumbnail_size = {w=math.floor(sb.width*scale+0.5), h=math.floor(sb.height*scale+0.5)}
-                end
-                self.state.storyboard.scale = scale
-
-                local divisor = 1 -- only save every n-th thumbnail
-                if options.storyboard_max_thumbnail_count then
-                    divisor = math.ceil(self.state.thumbnail_count / options.storyboard_max_thumbnail_count)
-                end
-                self.state.storyboard.divisor = divisor
-                self.state.thumbnail_count = math.floor(self.state.thumbnail_count / divisor)
-                self.state.thumbnail_delta = sb.duration / self.state.thumbnail_count
-
-                -- Prefill individual thumbnail states
-                self.state.thumbnails = {}
-                for i = 1, self.state.thumbnail_count do
-                    self.state.thumbnails[i] = -1
-                end
-
-                msg.info(string.format("Storyboard info acquired! Using %d of %d thumbnails sized %dx%d", self.state.thumbnail_count, self.state.original_count, sb.width, sb.height))
-                self.state.available = true
+            if self:process_storyboard_data(sb) then
                 callback()
             end
         end
@@ -1483,6 +1564,8 @@ function Thumbnailer:check_rutube_storyboard(on_success)
     if base_url then
         local sb_w, sb_h = self:obtain_dimensions(base_url .. "/Sec0.jpg?size=m") -- obtain dimensions of the first thumbnail
         if sb_w and sb_h then
+            if sb_w == -1 then return end
+            
             self.state.storyboard = {}
             self.state.storyboard.rows = 1
             self.state.storyboard.cols = 1
@@ -1613,18 +1696,15 @@ function Thumbnailer:register_client()
 
     self.worker_register_timeout = mp.get_time() + 2
 
-    mp.register_script_message("mpv_thumbnail_script-ready", function(index, path)
-        self:on_thumb_ready(tonumber(index), path)
-    end)
-    mp.register_script_message("mpv_thumbnail_script-progress", function(index, path)
-        self:on_thumb_progress(tonumber(index), path)
+    mp.register_script_message("storyboard_thumbnailer-ready", function(indexes_json)
+        self:on_thumbs_ready(utils.parse_json(indexes_json) or {})
     end)
 
-    mp.register_script_message("mpv_thumbnail_script-worker", function(worker_name)
+    mp.register_script_message("storyboard_thumbnailer-worker", function(worker_name)
         if not self.workers[worker_name] then
             msg.debug("Registered worker", worker_name)
             self.workers[worker_name] = true
-            mp.commandv("script-message-to", worker_name, "mpv_thumbnail_script-slaved")
+            mp.commandv("script-message-to", worker_name, "storyboard_thumbnailer-slaved")
         end
     end)
 end
@@ -1667,8 +1747,6 @@ function Thumbnailer:start_worker_jobs()
             file:close()
         end
     end
-    
-    if not check_generation_progress:is_enabled() then check_generation_progress:resume() end
 
     local worker_list = {}
     for worker_name in pairs(self.workers) do table.insert(worker_list, worker_name) end
@@ -1708,9 +1786,21 @@ function Thumbnailer:start_worker_jobs()
         for i = 1, worker_count do worker_jobs[worker_list[i]] = {} end
 
         -- Split frames amongst the workers
+        -- Ensure all thumbnails from the same atlas are assigned to the same worker
+        local atlas_pictures = self.state.storyboard.rows * self.state.storyboard.cols
+        local taken_frames = {}
         for i, thumbnail_index in ipairs(frame_job_order) do
-            local worker_id = worker_list[ ((i-1) % worker_count) + 1 ]
-            table.insert(worker_jobs[worker_id], thumbnail_index)
+            if not taken_frames[thumbnail_index] then
+                local worker_id = worker_list[ ((i-1) % worker_count) + 1 ]
+                local atlas_idx = math.floor((thumbnail_index - 1) * self.state.storyboard.divisor / atlas_pictures)
+                for idx = 0, atlas_pictures - 1 do
+                    local index = math.floor((atlas_idx * atlas_pictures + idx) / self.state.storyboard.divisor) + 1
+                    if (atlas_idx * atlas_pictures + idx) % self.state.storyboard.divisor == 0 and index <= self.state.thumbnail_count then
+                        taken_frames[index] = true
+                        table.insert(worker_jobs[worker_id], index)
+                    end
+                end
+            end
         end
 
         local state_json_string, err = utils.format_json(self.state)
@@ -1724,7 +1814,7 @@ function Thumbnailer:start_worker_jobs()
             if #worker_frames > 0 then
                 local frames_json_string = utils.format_json(worker_frames)
                 msg.debug("Assigning job to", worker_name, frames_json_string)
-                mp.commandv("script-message-to", worker_name, "mpv_thumbnail_script-job", state_json_string, frames_json_string)
+                mp.commandv("script-message-to", worker_name, "storyboard_thumbnailer-job", state_json_string, frames_json_string)
             end
         end
         
@@ -1741,10 +1831,17 @@ function Thumbnailer:start_worker_jobs()
 end
 
 mp.register_event("start-file", function() Thumbnailer:on_start_file() end)
+if options.storyboard_enable and mpv_0_39_above then
+    mp.observe_property("stream-open-filename", "string", function(_, stream_fname)
+        local path = mp.get_property("path") or ""
+        if path:find("https?://") and path ~= stream_fname then -- url was succesfully parsed by yt-dlp
+            Thumbnailer:request_storyboard(path, true)
+        end
+    end)
+end
 mp.register_event("end-file", function()
     video_loaded = false
     clear() -- remove thumbnail if it was displayed
-    stop_checking()
 end)
 
 Thumbnailer:register_client()
@@ -1792,10 +1889,14 @@ function display_storyboard_thumbnail(target_time, x, y, script)
 
                 local ass = assdraw.ass_new()
                 local scale = properties["display-hidpi-scale"] or 1
+                local framegraph_h = 10 * scale
+                local framegraph_pad = 2 * scale
                 local progress_bar_w = displaying_size_w
-                local progress_bar_h = 24 * scale
+                local progress_bar_h = 21 * scale + framegraph_h + framegraph_pad
                 local bg_left = x + (displaying_size_w - progress_bar_w) / 2
                 local bg_top = y - progress_bar_h - (options.vertical_offset * scale)
+                local framegraph_top = bg_top + progress_bar_h - framegraph_h - framegraph_pad
+                local block_w = (progress_bar_w - framegraph_pad * 2) / thumbs_total
                 
                 -- Draw background
                 ass:new_event()
@@ -1811,18 +1912,38 @@ function display_storyboard_thumbnail(target_time, x, y, script)
                 ass:an(8)
                 ass:append(("{\\fs%f\\bord0\\1a&H%X&}"):format(20 * scale, options.text_alpha))
                 ass:append(("%d%% - %d/%d"):format(math.floor((thumbs_ready / thumbs_total) * 100), thumbs_ready, thumbs_total))
-
-                -- Draw thumbnailing progress line
+                
+                -- Draw finished thumbnail blocks
                 ass:new_event()
-                ass:pos(bg_left + (2 * scale), bg_top + progress_bar_h - math.floor(3 * scale + 0.5))
-                local estimated_progress = thumbs_ready / thumbs_total -- estimated thumbnailing progress that not equal to count of generated thumbnails if using atlases
-                if Thumbnailer.state.storyboard and Thumbnailer.state.storyboard.rows > 1 and Thumbnailer.state.storyboard.cols > 1 then
-                    estimated_progress = estimated_progress * Thumbnailer.state.storyboard.rows * Thumbnailer.state.storyboard.cols * 0.9 * (thumbs_total / Thumbnailer.state.original_count)
+                ass:pos(bg_left + framegraph_pad, framegraph_top)
+                ass:append(("{\\bord0\\1c&HFFFFFF&\\1a&H%X&"):format(options.text_alpha))
+                ass:draw_start(2)
+                -- concatenation to long strings due to many thumbnails is too slow and may exceed frame time, so build string using a table
+                local finished_blocks = {}
+                local function rect(rx0, ry0, rx1, ry1) -- from assdraw source https://github.com/mpv-player/mpv/blob/master/player/lua/assdraw.lua
+                    local ass_scale = 2 ^ (ass.scale - 1)
+                    local x0 = math.ceil(rx0 * ass_scale)
+                    local y0 = math.ceil(ry0 * ass_scale)
+                    local x1 = math.ceil(rx1 * ass_scale)
+                    local y1 = math.ceil(ry1 * ass_scale)
+                    return string.format(" m %d %d l %d %d l %d %d l %d %d", x0, y0, x0, y1, x1, y1, x1, y0)
                 end
-                ass:append(("{\\bord0\\1c&H70E070&\\1a&H%X&"):format(options.text_alpha))
-                ass:draw_start()
-                ass:rect_cw(0, 0, math.min(estimated_progress, 1) * (progress_bar_w - (4 * scale)), 2 * scale)
+                for i, v in ipairs(Thumbnailer.state.thumbnails) do
+                    if i ~= closest_index and v > 0 then
+                        table.insert(finished_blocks, rect((i-1)*block_w, 0, i*block_w, framegraph_h))
+                    end
+                end
+                ass:append(table.concat(finished_blocks))
                 ass:draw_stop()
+                
+                if closest_index then
+                    ass:new_event()
+                    ass:pos(bg_left + framegraph_pad, framegraph_top)
+                    ass:append(("{\\bord0\\1c&H4444FF&\\1a&H%X&"):format(options.text_alpha))
+                    ass:draw_start(2)
+                    ass:rect_cw((closest_index-1)*block_w, 0, closest_index*block_w, framegraph_h)
+                    ass:draw_stop()
+                end
                 
                 progress_bar.data = ass.text
                 progress_bar:update()
@@ -1843,13 +1964,13 @@ if options.clear_cache_timeout >= 0 then
         local folders = utils.readdir(options.cache_directory)
         if folders then
             msg.debug("Starting deletion of old folders with saved thumbnails")
-            for k,v in pairs(folders) do
-                local dir = join_paths(options.cache_directory, v)
+            for _, folder in ipairs(folders) do
+                local dir = join_paths(options.cache_directory, folder)
                 local modtime = utils.file_info(dir)["mtime"]
                 if options.clear_cache_timeout == 0 or (modtime and (time - modtime) > (options.clear_cache_timeout * 86400)) then
                     local files = utils.readdir(dir)
                     msg.verbose("Deleting thumbnails cache folder: " .. dir .. " (" .. #files .. " files)")
-                    for _, file in pairs(files) do
+                    for _, file in ipairs(files) do
                         os.remove(join_paths(dir, file))
                     end
                     if ON_WINDOWS then

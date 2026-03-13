@@ -48,10 +48,15 @@ function Element:init(id, props)
 end
 
 function Element:destroy()
-	for _, disposer in ipairs(self._disposers) do disposer() end
+	self:dispose()
 	self.destroyed = true
 	self:remove_key_bindings()
 	Elements:remove(self)
+end
+
+-- Calls all disposers registered for this element (usually mpv events/prop observers).
+function Element:dispose()
+	for _, disposer in ipairs(self._disposers) do disposer() end
 end
 
 function Element:reset_proximity() self.proximity, self.proximity_raw = 0, math.huge end
@@ -157,7 +162,7 @@ end
 -- Briefly flashes the element for `options.flash_duration` milliseconds.
 -- Useful to visualize changes of volume and timeline when changed via hotkeys.
 function Element:flash()
-	if self.enabled and options.flash_duration > 0 and (self.proximity < 1 or self._flash_out_timer:is_enabled()) then
+	if self.enabled and options.flash_duration > 0 then
 		self:tween_stop()
 		self.forced_visibility = 1
 		request_render()
