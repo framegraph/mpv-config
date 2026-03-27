@@ -601,7 +601,12 @@ function file_loaded()
         return
     end
 
-	local args = {"curl", "-L", "-s", "-G", "-m", "15", "--data-urlencode", ("categories=[%s]"):format(table.concat(all_categories, ","))}
+    -- иногда сервер sponsorblock возвращает http-ошибки 500 / 503, которые могут пройти при повторном обращении
+    -- однако при переподключении удачный результат дописывается к выводу в stdout от предыдущей попытки, что ломает парсинг json
+    -- поэтому пишем во временный файл, который перезаписывается после каждой новой попытки
+    local out_path = utils.join_path((package.config:sub(1,1) ~= '/') and os.getenv("TEMP") or "/tmp/", "sponsorblock_out" .. utils.getpid())
+	local args = {"curl", "-L", "-s", "-G", "--max-time", "10", "--retry", "3", "--retry-delay", "0", "-o", out_path, "-w", "%{http_code}",
+            "--data-urlencode", ("categories=[%s]"):format(table.concat(all_categories, ","))}
 	local url = options.server
 	if options.hash == "true" or options.hash == "yes" then
 		url = ("%s/%s"):format(url, string.sub(sha256(youtube_id), 0, 4))
@@ -617,9 +622,16 @@ function file_loaded()
 		capture_stdout = true,
 		args = args
 	}
-    mp.msg.debug("Received data:", sponsors.stdout)
+    local response = "(missing output file)"
+    local file = io.open(out_path)
+    if file then
+        response = file:read("*a")
+        file:close()
+        os.remove(out_path)
+    end
+    mp.msg.debug(string.format("curl status: %d, received data: %s", sponsors.status or -1, response))
     
-    local json = utils.parse_json(sponsors.stdout or "")
+    local json = utils.parse_json(response)
     if type(json) == "table" then
         if options.hash == "true" or options.hash == "yes" then
             for _, i in pairs(json) do
@@ -640,13 +652,13 @@ function file_loaded()
         end
     end
         
-    if sponsors.stdout and (sponsors.stdout:lower():match("^not found") or type(json) == "table") then
+    if response:lower():match("^not found") or type(json) == "table" then
         -- не ошибка - сегментов просто нет в базе для текущего видео
         mp.msg.info("Sponsored segments not found")
         ranges_cache[youtube_id] = {}
     elseif not sponsors.killed_by_us then
         local err = "Unable to fetch SponsorBlock segments" .. (sponsors.status == 28 and " (network timeout)" or "")
-        mp.msg.error(err)
+        mp.msg.error(err .. ((sponsors.stdout ~= "" and sponsors.stdout ~= "000") and (", status code: " .. sponsors.stdout) or ""))
         mp.osd_message(is_rus and "Не удалось получить сегменты SponsorBlock" .. (sponsors.status == 28 and " (таймаут сети)" or "") or err)
         youtube_id = ""
     end
@@ -916,7 +928,7 @@ end
 
 function toggle()
     if not ranges then
-        mp.osd_message("[sponsorblock] " .. (is_rus and "Сегменты недоступны" or "Segments unavailable"))
+        mp.osd_message("[sponsorblock] " .. (is_rus and "откл (сегменты недоступны)" or "off (segments unavailable)"))
 	elseif ON then
 		disable()
 		mp.osd_message("[sponsorblock] " .. (is_rus and "откл" or "off"))
