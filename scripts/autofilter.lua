@@ -412,25 +412,55 @@ function toggle_cache_mode()
     end
 end
 
-function get_system_proxy_info(param) -- получение системного прокси командой, запущенной плеером (без всплывающих окон)
-    local res = mp.command_native({
-        name = "subprocess",
-        capture_stdout = true,
-        playback_only = false,
-        args = {"reg", "query", [[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings]], "/v", param}
-    })
-    return res.stdout or ""
+
+local ffi_loaded, ffi
+function get_system_proxy_info(param, pattern)
+    local function get_system_proxy_info_ffi(param) -- получение системного прокси обращенем к WinAPI через FFI (мгновенно)
+        local HKEY_CURRENT_USER = 0x80000001
+        local KEY_READ_ONLY = 0x1
+        local hkey = ffi.new("uint64_t[1]")
+        local subkey = [[Software\Microsoft\Windows\CurrentVersion\Internet Settings]]
+        if ffi.C.RegOpenKeyExA(HKEY_CURRENT_USER, subkey, 0, KEY_READ_ONLY, hkey) ~= 0 then return end
+        
+        local type_, size = ffi.new("DWORD[1]"), ffi.new("DWORD[1]", 256)
+        local buf = ffi.new("char[256]")
+        local ok = ffi.C.RegQueryValueExA(hkey[0], param, nil, type_, buf, size) == 0
+        ffi.C.RegCloseKey(hkey[0])
+        if not ok then return end
+        
+        if type_[0] == 4 then
+            return string.format("%x", ffi.cast("DWORD*", buf)[0])
+        else
+            return ffi.string(buf, size[0] - 1)
+        end
+    end
+    
+    local function get_system_proxy_info_subprocess(param) -- получение системного прокси утилитой reg.exe, запущенной плеером (занимает ~50 мс)
+        local res = mp.command_native({
+            name = "subprocess",
+            capture_stdout = true,
+            playback_only = false,
+            args = {"reg", "query", [[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings]], "/v", param}
+        })
+        return res.stdout or ""
+    end
+    
+    if ffi_loaded then
+        return get_system_proxy_info_ffi(param) or mp.msg.warn("FFI failed, using fallback") or get_system_proxy_info_subprocess(param):match(pattern)
+    else
+        return get_system_proxy_info_subprocess(param):match(pattern)
+    end
 end
 
 local sysproxy_set = false
 local prev_proxy_ip = ""
 function check_system_proxy()
-    local path = mp.get_property("path") or ""
-    if path:match("^https?://") or mp.get_property_bool("idle-active") then -- проверяем только при открытии http(s) ссылки и при запуске плеера
-        local enabled = get_system_proxy_info("ProxyEnable"):match("REG_DWORD%s+0x(.)")
+    local path = mp.get_property("path")
+    if not path or path:match("^https?://") then -- проверяем только при открытии http(s) ссылки и при запуске плеера
+        local enabled = get_system_proxy_info("ProxyEnable", "REG_DWORD%s+0x(.)")
         local sys_proxy = nil
         if enabled == "1" then
-            sys_proxy = get_system_proxy_info("ProxyServer"):match("REG_SZ%s+([^\r\n]+)")
+            sys_proxy = get_system_proxy_info("ProxyServer", "REG_SZ%s+([^\r\n]+)")
         end
         if sys_proxy then
             local proxy_ip = sys_proxy:gsub("localhost", "127.0.0.1")
@@ -458,9 +488,29 @@ end
 if not (package.config:sub(1,1) ~= '/') then
     mp.msg.warn("Сборка (и конкретно этот скрипт) рассчитаны на использование только под Windows!")
 elseif o.use_system_proxy >= 1 then
+    ffi_loaded, ffi = pcall(require, "ffi")
+    if ffi_loaded then
+        if ffi.abi("64bit") then
+            ffi.cdef[[
+                typedef unsigned long long uint64_t;
+                typedef long LSTATUS;
+                typedef unsigned long DWORD;
+                LSTATUS RegOpenKeyExA(uint64_t, const char*, DWORD, DWORD, uint64_t*);
+                LSTATUS RegQueryValueExA(uint64_t, const char*, void*, DWORD*, void*, DWORD*);
+                LSTATUS RegCloseKey(uint64_t);
+            ]]
+        else
+            mp.msg.info("Получение системного прокси через FFI работает только на 64-битном mpv - используется резервный способ")
+            ffi_loaded = false
+        end
+    else -- официальные билды mpv, от shinchiro и мой билд mpv - все используют LuaJIT
+        mp.msg.warn("Обнаружен кастомный билд mpv без LuaJIT - используется более медленный способ получения системного прокси")
+    end
+    
     check_system_proxy()
     if o.use_system_proxy >= 2 then
-        mp.register_event("start-file", check_system_proxy)
+        -- обязательно синхронное выполнение, чтобы прокси был известен строго до запуска Ютуб-парсера (из-за чего и стало важно мгновенное его получение)
+        mp.add_hook("on_load", 3, check_system_proxy)
     end
 end
 
