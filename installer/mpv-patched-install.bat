@@ -15,10 +15,10 @@ call :ensure_admin
 :: Command line arguments to use when launching mpv from a file association
 set mpv_args=
 
-:: Get mpv.exe location
+:: Get mpv-patched.exe location
 cd /D %~dp0\..
-set mpv_path=%cd%\mpv.exe
-if not exist "%mpv_path%" call :die "mpv.exe not found"
+set mpv_path=%cd%\mpv-patched.exe
+if not exist "%mpv_path%" call :die "mpv-patched.exe not found"
 
 :: Get mpv-icon.ico location
 set icon_path=%~dp0mpv-icon.ico
