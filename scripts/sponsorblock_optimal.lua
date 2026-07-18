@@ -158,6 +158,7 @@ local transition_active, notice_target_opacity
 local button_left, button_top, button_w, button_h
 local scale = options.scale
 local prev_time_left = -1
+local init_hover_state
 
 local skip_notice = mp.create_osd_overlay("ass-events")
 skip_notice.z = 10000
@@ -222,7 +223,7 @@ end)
 render_generator:kill()
 
 function calc_alpha(opaque_alpha)
-    local normalized_opacity = notice_opacity + options.min_opacity * (1 - notice_opacity)
+    local normalized_opacity = notice_opacity + (not notice_data.skipped and options.min_opacity or 0) * (1 - notice_opacity)
     local skipped_mag = (notice_data.skipped and not notice_focused) and options.opacity_after_skip or 1
     return 255 - (255 - opaque_alpha) * normalized_opacity * skipped_mag
 end
@@ -266,6 +267,7 @@ function render(curr_time_pos)
             render_generator:kill()
             if notice_data.skipped and notice_opacity == 0 then
                 notice_data = {}
+                return
             end
         end
     end
@@ -385,11 +387,15 @@ function on_mouse_move(_, mouse_pos)
     end
     if mouse_pos and mouse_pos.hover and (not notice_data.skipped or focused) then
         reset_fade_out_timer(options.osc_duration)
-        if notice_active and (not transition_active or notice_target_opacity < 1) and not (notice_opacity == 1 and not transition_active) then
+        if focused then
+            notice_opacity = 1
+            transition_active = false
+            render_generator:kill()
+        elseif notice_active and (not transition_active or notice_target_opacity < 1) and not (notice_opacity == 1 and not transition_active) then
             start_transition(1)
         end
     end
-    if notice_active then
+    if notice_active and mouse_pos then
         if notice_focused ~= focused then
             notice_focused = focused
             render(mp.get_property_number("time-pos"))
@@ -399,10 +405,11 @@ function on_mouse_move(_, mouse_pos)
                 mp.remove_key_binding("skip-click")
             end
         end
-        if not mouse_pos.hover and not notice_focused and (not transition_active or notice_target_opacity > 0) then
+        if not mouse_pos.hover and not notice_focused and (not transition_active or notice_target_opacity > 0) and init_hover_state ~= false then
             start_transition(0)
         end
     end
+    if mouse_pos and mouse_pos.hover then init_hover_state = nil end
 end
 
 function skip_ads(name,pos)
@@ -463,6 +470,7 @@ function enable()
     for _, segment in ipairs(ranges) do
         segment.already_skipped = nil
     end
+    init_hover_state = (mp.get_property_native("mouse-pos") or {}).hover
     on_resize(_, mp.get_property_native("osd-dimensions"), true)
     mp.observe_property("time-pos", "native", skip_ads)
     mp.observe_property("mouse-pos", "native", on_mouse_move)
@@ -604,8 +612,12 @@ function file_loaded()
     -- иногда сервер sponsorblock возвращает http-ошибки 500 / 503, которые могут пройти при повторном обращении
     -- однако при переподключении удачный результат дописывается к выводу в stdout от предыдущей попытки, что ломает парсинг json
     -- поэтому пишем во временный файл, который перезаписывается после каждой новой попытки
-    local out_path = utils.join_path((package.config:sub(1,1) ~= '/') and os.getenv("TEMP") or "/tmp/", "sponsorblock_out" .. utils.getpid())
-	local args = {"curl", "-L", "-s", "-G", "--max-time", "10", "--retry", "3", "--retry-delay", "0", "-o", out_path, "-w", "%{http_code}",
+    local out_dir = (package.config:sub(1,1) ~= '/') and os.getenv("TEMP") or "/tmp/"
+    if mp.get_property("platform") == "android" then -- на android папка /tmp/ может быть недоступна
+        out_dir = mp.command_native({"expand-path", "~~/"})
+    end
+    local out_path = utils.join_path(out_dir, "sponsorblock_out" .. utils.getpid())
+	local args = {"curl", "-L", "-sS", "-G", "--max-time", "10", "--retry", "3", "--retry-delay", "0", "--compressed", "-o", out_path, "-w", "%{http_code}",
             "--data-urlencode", ("categories=[%s]"):format(table.concat(all_categories, ","))}
 	local url = options.server
 	if options.hash == "true" or options.hash == "yes" then
@@ -629,7 +641,6 @@ function file_loaded()
         file:close()
         os.remove(out_path)
     end
-    mp.msg.debug(string.format("curl status: %d, received data: %s", sponsors.status or -1, response))
     
     local json = utils.parse_json(response)
     if type(json) == "table" then
@@ -658,8 +669,9 @@ function file_loaded()
         ranges_cache[youtube_id] = {}
     elseif not sponsors.killed_by_us then
         local err = "Unable to fetch SponsorBlock segments" .. (sponsors.status == 28 and " (network timeout)" or "")
-        mp.msg.error(err .. ((sponsors.stdout ~= "" and sponsors.stdout ~= "000") and (", status code: " .. sponsors.stdout) or ""))
+        mp.msg.error(err .. ((sponsors.stdout ~= "" and sponsors.stdout ~= "000") and (", HTTP code: " .. sponsors.stdout) or ""))
         mp.osd_message(is_rus and "Не удалось получить сегменты SponsorBlock" .. (sponsors.status == 28 and " (таймаут сети)" or "") or err)
+        mp.msg.debug(string.format("curl status: %d, received data: %s", sponsors.status or -1, #response > 0 and response or "(nil)"))
         youtube_id = ""
     end
     
@@ -818,8 +830,8 @@ function exit_submit_menu()
 end
 
 function simulate_skip(_, pos)
-    if pos and start_pos <= pos and end_pos > pos then
-        mp.set_property("time-pos", end_pos+0.01)
+    if pos and start_pos <= pos and end_pos-0.01 > pos then
+        mp.set_property("time-pos", end_pos)
         submit_overlay.data = submit_overlay.data:gsub(".*\\N", string.format("{\\fscx70\\fscy70}%s {\\1c&H90FF90&}[p]{\\1c}\\N",
                 is_rus and "Для повторения пропуска нажмите" or "To repeat the skip, press"))
         submit_overlay:update()
@@ -865,7 +877,7 @@ function submit_segment()
             category = category_name
         }}
     })
-    local args = {"curl", "-L", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-A", user_agent, "-d", json_body, "-w", "\n%{http_code}"}
+    local args = {"curl", "-L", "-sS", "-X", "POST", "-H", "Content-Type: application/json", "-A", user_agent, "-d", json_body, "-w", "\n%{http_code}"}
     pass_current_proxy(args)
     table.insert(args, options.server) -- уже включает в себя нужный API endpoint
     

@@ -15,7 +15,8 @@ local opts = {
     active = true,
     reapply_delay = 0.3,
     osd_info = true,
-    transfer_filters = true
+    transfer_filters = true,
+    only_fullscreen = true
 }
 mp_options.read_options(opts)
 
@@ -152,6 +153,21 @@ function toggle_settings()
 end
 
 
+function remove_vid_from_watch_later() --отключение запоминания выбора пустой видео-дорожки при закрытии плеера с включённой подсветкой
+    local watch_later_props = mp.get_property_native("watch-later-options") or {}
+    local vid_removed = false
+    for i, opt in ipairs(watch_later_props) do
+        if opt == "vid" then
+            table.remove(watch_later_props, i)
+            vid_removed = true
+        end
+    end
+    if vid_removed then --перезапишется только 1 раз для всех последующих видео
+        mp.set_property_native("watch-later-options", watch_later_props)
+    end
+end
+
+local prev_window_resize
 function set_lavfi_complex(filter)
     if not filter and mp.get_property("lavfi-complex") == "" then return end
     local force_window = mp.get_property("force-window")
@@ -160,7 +176,18 @@ function set_lavfi_complex(filter)
     if not filter then
         mp.set_property("lavfi-complex", "")
         mp.set_property("vid", "1")
+        if prev_window_resize then
+            mp.set_property("auto-window-resize", prev_window_resize)
+            prev_window_resize = nil
+        end
     else
+        remove_vid_from_watch_later()
+        if not mp.get_property_bool("fullscreen") then
+            prev_window_resize = mp.get_property("auto-window-resize")
+            -- иначе при включении подсветки в оконном режиме плеер может слегка изменить размеры окна, 
+            -- из-за чего скрипт расценит это за ручное изменение размеров, и тут же её отключит
+            mp.set_property("auto-window-resize", "no")
+        end
         mp.set_property("vid", "no")
         mp.set_property("lavfi-complex", filter)
     end
@@ -171,7 +198,11 @@ end
 
 function set_blur(reappl)
     if applied then return end
-    if not mp.get_property_bool("fullscreen") then set_reason("работает только в полноэкранном режиме", reappl) return end
+    -- mpv-android всегда считает, что не находится в полноэкранном режиме, из-за чего подсветка не может включиться
+    if opts.only_fullscreen and not mp.get_property_bool("fullscreen") and mp.get_property("platform") ~= "android" then
+        set_reason("работает только в полноэкранном режиме", reappl)
+        return 
+    end
     
     vf_list = mp.get_property("vf")
     if string.find(vf_list, "@autocrop") then mp.add_timeout(opts.reapply_delay, set_blur) return end 
@@ -185,7 +216,11 @@ function set_blur(reappl)
     local par = mp.get_property_number("video-params/par") or 1
     local height = mp.get_property_number("video-params/h")
     local width = mp.get_property_number("video-params/w")
-    if not height or not width or not mp.get_property("video-out-params") then mp.add_timeout(opts.reapply_delay, set_blur) return end
+    if not height or not width or not mp.get_property("video-out-params") then
+        set_reason("разрешение видео недоступно", reappl) 
+        mp.add_timeout(opts.reapply_delay, function() set_blur(true) end)
+        return 
+    end
     
     local colorlevels = mp.get_property("video-params/colorlevels")
     local colormatrix = mp.get_property("video-params/colormatrix")
@@ -344,8 +379,8 @@ function set_blur(reappl)
     applied = true
     mp.commandv("vf", "clr", "")
     
-    local lr = math.min(math.floor(options[1].option[6] * corr + 0.5), math.floor(mindim/2 + 0.5) - 1)
-    local cr = math.min(math.floor(options[1].option[6] * corr + 0.5), math.floor(mindim/4 + 0.5) - 1)
+    local lr = math.min(math.ceil(options[1].option[6] * corr), math.floor(mindim/2) - 1)
+    local cr = math.min(math.ceil(options[1].option[6] * corr), math.floor(mindim/4) - 1)
     local blur = string.format("boxblur=lr=%i:lp=%i:cr=%i:cp=%i", lr, options[2].option[6], cr, options[2].option[6])
 
     zone_1 = string.format("[a] %s,%s%s,%s [a_fin]", cropped_scaled_1, blur, darkening1, scaled_final)
@@ -407,7 +442,7 @@ end)
 
 function reset_blur()
     c = c+1
-    if c <= 1 then return end
+    if c <= 3 then return end
     unset_blur()
     reapplication_timer:kill()
     reapplication_timer:resume()
@@ -420,6 +455,13 @@ function reapply_blur()
     elseif not active then
         toggle()
     end
+end
+
+function observe_properties()
+    c = 0
+    mp.observe_property("fullscreen", "native", reset_blur)
+    mp.observe_property("osd-width", "native", reset_blur)
+    mp.observe_property("osd-height", "native", reset_blur)
 end
 
 function toggle()
@@ -439,8 +481,7 @@ function toggle()
         end
         n = n + 1
         set_blur()
-        c = 0
-        mp.observe_property("fullscreen", "native", reset_blur)
+        observe_properties()
     end
 end
 function set_autocrop()
@@ -460,15 +501,13 @@ function set_autocrop()
     mp.command("script-message-to autocrop toggle-autocrop clear+silent+addcrop=" .. opts.overscan)
     n = n + 1
     mp.add_timeout(0.6, set_blur)
-    c = 0
-    mp.observe_property("fullscreen", "native", reset_blur)
+    observe_properties()
 end
 
 if active then
     n = n + 1
     set_blur(true)
-    c = 0
-    mp.observe_property("fullscreen", "native", reset_blur)
+    observe_properties()
 end
 
 mp.register_script_message("toggle-blur", toggle)
@@ -506,10 +545,6 @@ mp.add_hook('on_preloaded', 100, function() --иначе может случит
     end
 end)
 mp.register_event("file-loaded", function()
-    if isvid and mp.get_property_native("vid") == false and mp.get_property("lavfi-complex") == "" then --исправление запоминания выбора пустой видеодорожки при закрытии плеера с вкл подсветкой
-        mp.set_property("vid", 1)
-        msg.info("Исправление выбора пустой видео-дорожки")
-    end
     if orig_value_hwdec then
         mp.set_property("hwdec", orig_value_hwdec)
         orig_value_hwdec = nil
