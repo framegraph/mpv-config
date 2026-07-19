@@ -412,6 +412,20 @@ function toggle_cache_mode()
     end
 end
 
+function speed_scaled_seek(val, flags)
+    if not val or not tonumber(val) then
+        mp.osd_message("Не указано число секунд для перемотки")
+        return
+    end
+    
+    if not (flags and (flags:find("absolute") or flags:find("percent"))) then
+        local speed = mp.get_property_native("user-data/skipsilence/enabled") and mp.get_property_native("user-data/skipsilence/base_speed")
+                or mp.get_property_number("speed") or 1
+        val = tostring(tonumber(val) * speed)
+    end
+    mp.commandv("seek", val, flags or "")
+end
+
 
 local ffi_loaded, ffi
 function get_system_proxy_info(param, pattern)
@@ -522,3 +536,4 @@ mp.register_script_message("toggle-hwdec", toggle_hwdec) -- включение �
 mp.register_script_message("swap-subtitles", swap_subs) -- поменять местами основные и вторые субтитры
 mp.register_script_message("add-color-temp", change_temp) -- изменение цветовой температуры видео на переданное число Кельвинов (работает только при --vo=gpu-next)
 mp.register_script_message("toggle-cache-mode", toggle_cache_mode) -- переключение между кэшированием целиком на диск и обратно (можно прямо во время воспроизведения)
+mp.register_script_message("speed-scaled-seek", speed_scaled_seek) -- относительная перемотка с учётом скорости воспроизведения

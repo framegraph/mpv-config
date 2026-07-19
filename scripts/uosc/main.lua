@@ -304,9 +304,11 @@ function update_config()
 
 	-- Timeline step
 	do
-		local is_exact = options.timeline_step:sub(-1) == '!'
-		config.timeline_step = tonumber(is_exact and options.timeline_step:sub(1, -2) or options.timeline_step)
-		config.timeline_step_flag = is_exact and 'exact' or ''
+		local is_exact = options.timeline_step:find('!')
+        local is_keyframes = options.timeline_step:find('~')
+        local is_speed_scaled = options.timeline_step:find('*')
+		config.timeline_step = tonumber(options.timeline_step:match("^[^!~*]+")) or 0
+		config.timeline_step_flag = (is_exact and 'exact' or (is_keyframes and 'keyframes' or '')) .. (is_speed_scaled and '*' or '')
 	end
 
 	-- Other

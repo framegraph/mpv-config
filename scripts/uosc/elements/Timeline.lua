@@ -212,12 +212,21 @@ function Timeline:render()
                 end
             end)
         end
+        local function seek_handler(val, flag)
+            if flag:sub(-1) == '*' then -- перемотка с учётом скорости воспроизведения
+                flag = flag:sub(1, -2)
+                local speed = mp.get_property_native("user-data/skipsilence/enabled") and mp.get_property_native("user-data/skipsilence/base_speed")
+                        or mp.get_property_number("speed") or 1
+                val = tostring(tonumber(val) * speed)
+            end
+            mp.commandv('seek', val, flag)
+        end
 		if config.timeline_step ~= 0 then
 			cursor:zone('wheel_down', self, function()
-				mp.commandv('seek', -config.timeline_step, config.timeline_step_flag)
+				seek_handler(-config.timeline_step, config.timeline_step_flag)
 			end)
 			cursor:zone('wheel_up', self, function()
-				mp.commandv('seek', config.timeline_step, config.timeline_step_flag)
+				seek_handler(config.timeline_step, config.timeline_step_flag)
 			end)
 		end
 	end
