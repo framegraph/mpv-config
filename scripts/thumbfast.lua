@@ -1085,7 +1085,7 @@ local function thumb(time, r_x, r_y, script)
 end
 
 local function watch_changes(fully_loaded)
-    if not dirty or not properties["video-out-params"] or storyboard_requested then return end
+    if not dirty or not properties["video-params"] or not properties["video-out-params"] or storyboard_requested then return end
     dirty = false
 
     local old_w = effective_w
@@ -1341,31 +1341,28 @@ function Thumbnailer:on_start_file()
     end
 end
 
-function Thumbnailer:check_ytdl_json()
-    local ytdl_result = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result") or {}
-    if ytdl_result.stdout then
-        local data = utils.parse_json(ytdl_result.stdout)
-        if data and data.formats then
-            local sb = nil
-            for _, format in ipairs(data.formats) do
-                -- looking for storyboard format with best resolution available
-                if format.format_note == "storyboard" and format.width and format.height then
-                    if not sb or format.width > sb.width or format.height > sb.height then
-                        sb = format
-                    end
+function Thumbnailer:check_ytdl_json(ytdl_result)
+    local data = utils.parse_json(ytdl_result.stdout or "")
+    if data and data.formats then
+        local sb = nil
+        for _, format in ipairs(data.formats) do
+            -- looking for storyboard format with best resolution available
+            if format.format_note == "storyboard" and format.width and format.height then
+                if not sb or format.width > sb.width or format.height > sb.height then
+                    sb = format
                 end
             end
-            if sb then
-                local mpv_duration = mp.get_property_number("duration") or 0
-                sb.duration = (mpv_duration > 1) and mpv_duration or data.duration
-                sb.extractor = data.extractor
-                return sb
-            end
+        end
+        if sb then
+            local mpv_duration = mp.get_property_number("duration") or 0
+            sb.duration = (mpv_duration > 1) and mpv_duration or data.duration
+            sb.extractor = data.extractor
+            return sb
         end
     end
 end
 
-function Thumbnailer:request_storyboard(initial_path, from_ytdl_json)
+function Thumbnailer:request_storyboard(initial_path, ytdl_result)
     local function on_success()
         if mp.get_property("path") == initial_path and self.state.available and not spawned then
             self.state.worker_input_path = initial_path
@@ -1374,18 +1371,18 @@ function Thumbnailer:request_storyboard(initial_path, from_ytdl_json)
         end
     end
     
-    if not from_ytdl_json then
+    if not ytdl_result then
         msg.info("Trying to get storyboard info...")
     end
     local json, err = utils.format_json({width=0, height=0, disabled=true, available=false, socket=options.socket, thumbnail=options.thumbnail, overlay_id=options.overlay_id})
     mp.command_native({"script-message", "thumbfast-info", json}) -- disable availability of the thumbnailer until we get storyboard data
     self.state.ready = true
     if not initial_path:find("https?://[^/]*rutube%.ru") then
-        if not from_ytdl_json then
+        if not ytdl_result then
             storyboard_requested = true
             self:check_storyboard_async(on_success)
         else
-            local sb_data = self:check_ytdl_json()
+            local sb_data = self:check_ytdl_json(ytdl_result)
             if sb_data and self:process_storyboard_data(sb_data) then
                 storyboard_requested = true
                 on_success()
@@ -1598,8 +1595,7 @@ function Thumbnailer:check_rutube_storyboard(on_success)
             elseif h < sb_h then
                 scale = math.max(0.1, h / sb_h)
             end
-            -- Fix washed out colors due to incorrect colorlevels of thumbnails during their processing
-            self.state.thumbnail_size = { w=math.floor(sb_w*scale+0.5), h=math.floor(sb_h*scale+0.5), col_corr=":in_range=limited:out_range=full" }
+            self.state.thumbnail_size = { w=math.floor(sb_w*scale+0.5), h=math.floor(sb_h*scale+0.5) }
             self.state.storyboard.scale = scale
 
             self.state.thumbnails = {}
@@ -1832,10 +1828,9 @@ end
 
 mp.register_event("start-file", function() Thumbnailer:on_start_file() end)
 if options.storyboard_enable and mpv_0_39_above then
-    mp.observe_property("stream-open-filename", "string", function(_, stream_fname)
-        local path = mp.get_property("path") or ""
-        if path:find("https?://") and path ~= stream_fname then -- url was succesfully parsed by yt-dlp
-            Thumbnailer:request_storyboard(path, true)
+    mp.observe_property("user-data/mpv/ytdl/json-subprocess-result", "native", function(_, ytdl_result)
+        if not Thumbnailer.state.available and ytdl_result and ytdl_result.status == 0 then -- url was succesfully parsed by yt-dlp
+            Thumbnailer:request_storyboard(mp.get_property("path") or "", ytdl_result)
         end
     end)
 end
@@ -1966,9 +1961,9 @@ if options.clear_cache_timeout >= 0 then
             msg.debug("Starting deletion of old folders with saved thumbnails")
             for _, folder in ipairs(folders) do
                 local dir = join_paths(options.cache_directory, folder)
-                local modtime = utils.file_info(dir)["mtime"]
+                local modtime = (utils.file_info(dir) or {})["mtime"]
                 if options.clear_cache_timeout == 0 or (modtime and (time - modtime) > (options.clear_cache_timeout * 86400)) then
-                    local files = utils.readdir(dir)
+                    local files = utils.readdir(dir) or {}
                     msg.verbose("Deleting thumbnails cache folder: " .. dir .. " (" .. #files .. " files)")
                     for _, file in ipairs(files) do
                         os.remove(join_paths(dir, file))
@@ -1976,7 +1971,7 @@ if options.clear_cache_timeout >= 0 then
                     if ON_WINDOWS then
                         mp.command('run cmd /c rmdir "' .. dir:gsub("\\", "\\\\") .. '"') -- on Windows, os.remove can't delete folders, even empty ones
                     else
-                        os.remove(dir) -- this should work on other platforms (not tested)
+                        os.remove(dir)
                     end
                 end
             end

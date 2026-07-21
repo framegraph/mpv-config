@@ -96,7 +96,13 @@ mp.register_event("file-loaded", function()
     local ytdl_json = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result/stdout") or ""
     local data = utils.parse_json(ytdl_json)
     
-    if o.auto_subs_list ~= "" and data and data.automatic_captions then
+    local already_loaded = false -- мой Ютуб-парсер (youtube-parser.lua) сам добавляет автоматические субтитры в список согласно настройкам
+    if data and data.requested_subtitles then
+        for lang in pairs(data.requested_subtitles) do
+            if lang:find("%-auto") then already_loaded = true end
+        end
+    end
+    if o.auto_subs_list ~= "" and data and data.automatic_captions and not already_loaded then
         local function add_subs(url, title, lang)
             -- добавление субтитров в список, с загрузкой (скачиванием) файлов только при непосредственном выборе этих субтитров
             local edl = "edl://!no_clip;!delay_open,media_type=sub,codec=webvtt;" .. "%" .. #url .. "%" .. url -- способ из ytdl_hook.lua

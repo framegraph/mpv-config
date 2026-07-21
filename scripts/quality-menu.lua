@@ -16,6 +16,9 @@ local opt = require('mp.options')
 local script_name = mp.get_script_name()
 
 local saved_ytdl_result = nil
+local unique_audio_tracks = false
+local slang = mp.get_property("slang") or ""
+local is_rus = slang:match("rus?,") or slang:match("rus?$")
 
 ---@type { [string]: Data }
 local url_data = {}
@@ -121,6 +124,7 @@ local opts = {
     --Be careful, misspelled columns simply won't be displayed, there is no error.
     columns_video = '-resolution,frame_rate,dynamic_range|language,bitrate_total,size,-codec_video,-codec_audio',
     columns_audio = 'audio_sample_rate,bitrate_total|size,language,-codec_audio',
+    columns_audio_tracks = '-format_note|bitrate_total,codec_audio,language',
 
     --columns used for sorting, see "columns_video" for available columns
     --comma separated list, prefix column with "-" to reverse sorting order
@@ -129,6 +133,13 @@ local opts = {
     --but they might influence the result.
     sort_video = 'height,fps,tbr,size,format_id',
     sort_audio = 'asr,tbr,size,format_id',
+    sort_audio_tracks = '-language,-format_note,asr,tbr',
+    
+    --Comma-separated prefixes of format_id field that represent sets of unique audio tracks
+    --(e.g. different dubs, "Stable volume" track) in priority order (first available set will be chosen)
+    --hint for Youtube: [~128kbps] 251 - Opus, 140 - AAC, 234 - AAC via HLS
+    --                  [~48kbps] 249 - Opus, 139 - AAC, 233 - AAC via HLS
+    audio_tracks_itags = "251,140,234"
 }
 opt.read_options(opts, 'quality-menu')
 
@@ -232,6 +243,7 @@ do
     ---@type { all: string[], all_align_left: boolean[], title: string[], title_align_left: boolean[], hint?: string[] }
     ---@diagnostic disable-next-line: param-type-mismatch
     opts.columns_audio = parse_columns(opts.columns_audio)
+    opts.columns_audio_tracks = parse_columns(opts.columns_audio_tracks)
 end
 
 -- special thanks to reload.lua (https://github.com/4e6/mpv-reload/)
@@ -248,11 +260,13 @@ local function reload_resume()
                 local video_data, audio_data
                 if not data.video_active_id then data.video_active_id = "" end
                 if not data.audio_active_id then data.audio_active_id = "" end
+                data.video_stream_has_audio = nil
                 for _, format in ipairs(stdout.formats) do
                     if format.format_id == data.video_active_id then
                         video_data = format
                         if format.acodec and format.acodec ~= "none" then -- don't load external audio stream if video stream also has audio
                             audio_data = nil
+                            data.video_stream_has_audio = true
                             break
                         end
                     elseif format.format_id == data.audio_active_id then
@@ -300,6 +314,7 @@ end
 local states = {
     video_menu = { type = 'video', type_capitalized = 'Video', name = 'video_menu', is_video = true },
     audio_menu = { type = 'audio', type_capitalized = 'Audio', name = 'audio_menu', is_video = false },
+    audio_tracks = { type = 'audio', type_capitalized = is_rus and 'Аудиодорожки' or 'Audio Tracks', name = 'audio_tracks', is_video = false },
     video_fetching = { type = 'video', type_capitalized = 'Video', name = 'video_fetching', is_video = true },
     audio_fetching = { type = 'audio', type_capitalized = 'Audio', name = 'audio_fetching', is_video = false },
 }
@@ -379,15 +394,31 @@ local function process_json(json)
     local requested_formats = json.requested_formats or json.requested_downloads or {}
     for _, format in ipairs(requested_formats) do
         -- preserve currently chosen tracks even if they are considered as unknown
-        if is_video(format) or (format.video_ext and format.video_ext ~= "none") or format.height then
+        if is_video(format) or (format.video_ext and format.video_ext ~= "none") or (format.height and format.height > 0) then
             requested_video = format.format_id
         elseif is_audio(format) or (format.audio_ext and format.audio_ext ~= "none") or format.resolution == "audio only" then
             requested_audio = format.format_id
         end
     end
+    
+    local audio_groups = {}
+    local selected_audio_group
+    for i = 1, #json.formats do
+        if json.formats[i].format_id and is_audio(json.formats[i]) then
+            local key = json.formats[i].format_id:match("^[^%-]+") or ""
+            audio_groups[key] = (audio_groups[key] or 0) + 1
+        end
+    end
+    for itag in opts.audio_tracks_itags:gmatch("[^,%s]+") do
+        if audio_groups[itag] and audio_groups[itag] > 1 then
+            selected_audio_group = itag
+            break
+        end
+    end
 
     local video_formats = {}
     local audio_formats = {}
+    local audio_group_formats = {}
     local all_formats = {}
     for i = #json.formats, 1, -1 do
         local format = json.formats[i]
@@ -397,8 +428,14 @@ local function process_json(json)
         elseif is_audio(format) then
             audio_formats[#audio_formats + 1] = format
             all_formats[#all_formats + 1] = format
+            if (selected_audio_group and string.match(format.format_id or "", "^"..selected_audio_group.."%-")
+                    or format.format_id == selected_audio_group or format.format_id == requested_audio) 
+            then
+                table.insert(audio_group_formats, format)
+            end
         end
     end
+    
 
     ---@param format FormatRaw
     local function populate_special_fields(format)
@@ -418,6 +455,7 @@ local function process_json(json)
 
     local sort_video, reverse_video = strip_minus(string_split(opts.sort_video, ','))
     local sort_audio, reverse_audio = strip_minus(string_split(opts.sort_audio, ','))
+    local sort_atracks, reverse_atracks = strip_minus(string_split(opts.sort_audio_tracks, ','))
 
     ---@param properties string[]
     ---@param reverse {[string]: boolean}
@@ -444,6 +482,7 @@ local function process_json(json)
     end
     if #sort_audio > 0 then
         table.sort(audio_formats, comp(sort_audio, reverse_audio))
+        table.sort(audio_group_formats, comp(sort_atracks, reverse_atracks))
     end
 
     ---@param size integer
@@ -522,6 +561,7 @@ local function process_json(json)
     return {
         video_formats = convert_to_format(video_formats, opts.columns_video.all),
         audio_formats = convert_to_format(audio_formats, opts.columns_audio.all),
+        audio_group_formats = convert_to_format(audio_group_formats, opts.columns_audio_tracks.all),
         video_active_id = requested_video,
         audio_active_id = requested_audio,
     }
@@ -560,7 +600,7 @@ local function uosc_set_format_counts()
         
         -- display custom uosc button only if track choice is available and show different badges depending on video quality
         if #data.video_formats > 1 or #data.audio_formats > 1 then
-            local quality_label, badge, w, h, fps
+            local quality_label, badge, w, h, fps, stream_props
             for _, stream in ipairs(data.video_formats) do
                 if stream.id == data.video_active_id and stream.properties then
                     if stream.properties.resolution then
@@ -570,14 +610,23 @@ local function uosc_set_format_counts()
                     if stream.properties.frame_rate then
                         fps = stream.properties.frame_rate:match("^[%d%.]+")
                     end
+                    stream_props = stream.properties
                 end
             end
             if w and h then
                 local short_side = math.min(tonumber(w), tonumber(h))
                 local long_side = math.max(tonumber(w), tonumber(h))
                 quality_label = short_side .. "p"
-                if fps and tonumber(fps) and tonumber(fps) > 31 then
+                if fps and tonumber(fps) then
                     quality_label = quality_label .. math.floor(tonumber(fps) + 0.5)
+                end
+                if stream_props.dynamic_range and stream_props.dynamic_range:lower():find("hdr") then
+                    quality_label = quality_label .. " HDR"
+                end
+                if stream_props.format_note and stream_props.format_note:lower():find("ai.upscale") then
+                    quality_label = quality_label .. " (AI-upscale)"
+                elseif stream_props.format_note and stream_props.format_note:lower():find("premium") then
+                    quality_label = quality_label .. " Premium"
                 end
                 quality_label = " (" .. quality_label .. ")"
                 if short_side >= 4320 or long_side >= 7680 then
@@ -597,8 +646,6 @@ local function uosc_set_format_counts()
                 badge = tostring(#data.video_formats)
             end
             
-            local slang = mp.get_property("slang") or ""
-            local is_rus = slang:match("rus?,") or slang:match("rus?$")
             mp.commandv('script-message-to', 'uosc', 'set-button', 'quality-menu', utils.format_json({
                 icon = "theaters",
                 active = false,
@@ -607,6 +654,26 @@ local function uosc_set_format_counts()
                 command = 'script-binding ' .. script_name .. '/video_formats_toggle'
             })..'')
             
+            if data.audio_group_formats and #data.audio_group_formats > 1 then
+                unique_audio_tracks = true
+                local track_label = ""
+                for _, stream in ipairs(data.audio_formats) do
+                    if stream.id == data.audio_active_id and stream.properties and (stream.properties.format_note or '') ~= '' then
+                        track_label = string.format(" (%s)", stream.properties.format_note)
+                    end
+                end
+                mp.commandv('script-message-to', 'uosc', 'set-button', 'audio-tracks-menu', utils.format_json({
+                    icon = "graphic_eq",
+                    active = false,
+                    badge = tostring(#data.audio_group_formats),
+                    tooltip = (is_rus and 'Аудиодорожки' or 'Audio tracks') .. track_label,
+                    command = 'script-binding ' .. script_name .. '/audio_tracks_toggle'
+                })..'')
+            else
+                unique_audio_tracks = false
+                mp.commandv('script-message-to', 'uosc', 'set-button', 'audio-tracks-menu', '{"icon":"","hide":true}')
+            end
+            
             return
         end
     else
@@ -614,10 +681,10 @@ local function uosc_set_format_counts()
         mp.commandv('script-message-to', 'uosc', 'set', 'aformats', 0)
     end
     
-    mp.commandv('script-message-to', 'uosc', 'set-button', 'quality-menu', utils.format_json({
-        icon = '',
-        hide = true
-    })..'')
+    for _, menu_type in ipairs({"quality-menu", "audio-tracks-menu"}) do
+        mp.commandv('script-message-to', 'uosc', 'set-button', menu_type, '{"icon":"","hide":true}')
+    end
+    unique_audio_tracks = false
 end
 
 ---@param json string
@@ -888,7 +955,7 @@ end
 ---@param menu_type UIState
 local function uosc_menu_open(formats, active_format, menu_type)
     local menu = {
-        title = menu_type.type_capitalized .. ' Formats',
+        title = menu_type.type_capitalized .. (menu_type.name == 'audio_tracks' and '' or ' Formats'),
         items = {},
         type = 'quality-menu-' .. menu_type.name,
         keep_open = true,
@@ -900,31 +967,33 @@ local function uosc_menu_open(formats, active_format, menu_type)
         }
     }
 
-    menu.items[#menu.items + 1] = {
-        title = menu_type.to_other_type.type_capitalized,
-        italic = true,
-        bold = true,
-        hint = 'open menu',
-        value = {
-            'script-message-to',
-            script_name,
-            menu_type.to_other_type.type .. '_formats_toggle',
-        },
-    }
-    menu.items[#menu.items + 1] = {
-        title = 'Disabled',
-        italic = true,
-        muted = true,
-        hint = '—',
-        active = active_format == '',
-        value = {
-            'script-message-to',
-            script_name,
-            menu_type.type .. '-format-set',
-            current_url,
-            '',
+    if menu_type.name ~= 'audio_tracks' then
+        menu.items[#menu.items + 1] = {
+            title = menu_type.to_other_type.type_capitalized,
+            italic = true,
+            bold = true,
+            hint = 'open menu',
+            value = {
+                'script-message-to',
+                script_name,
+                menu_type.to_other_type.type .. '_formats_toggle',
+            },
         }
-    }
+        menu.items[#menu.items + 1] = {
+            title = 'Disabled',
+            italic = true,
+            muted = true,
+            hint = '—',
+            active = active_format == '',
+            value = {
+                'script-message-to',
+                script_name,
+                menu_type.type .. '-format-set',
+                current_url,
+                '',
+            }
+        }
+    end
 
     for _, format in ipairs(formats) do
         menu.items[#menu.items + 1] = {
@@ -975,7 +1044,7 @@ end
 ---@param columns string[]
 ---@param column_align_left boolean[]
 ---@return string[]
-local function format_table(formats, columns, column_align_left)
+local function format_table(formats, columns, column_align_left, skip_column_filter)
     local column_widths = {}
     for _, format in pairs(formats) do
         for col, prop in ipairs(columns) do
@@ -986,7 +1055,7 @@ local function format_table(formats, columns, column_align_left)
         end
     end
 
-    local identical_columns = #formats < 2 and {} or identical_for_all(formats, columns)
+    local identical_columns = (#formats < 2 or skip_column_filter) and {} or identical_for_all(formats, columns)
 
     local show_columns = {}
     for i, width in ipairs(column_widths) do
@@ -1018,8 +1087,8 @@ end
 ---@param formats Format[]
 ---@param columns string[]
 ---@return string[]
-local function format_csv(formats, columns)
-    local identical_props = #formats < 2 and {} or identical_for_all(formats, columns)
+local function format_csv(formats, columns, skip_column_filter)
+    local identical_props = (#formats < 2 or skip_column_filter) and {} or identical_for_all(formats, columns)
     local hints = {}
     for i, format in ipairs(formats) do
         local row = {}
@@ -1039,12 +1108,12 @@ end
 local function ensure_menu_data_filled(formats, menu_type)
     if uosc_available then
         if formats[1] and formats[1].title == nil then
-            local columns = menu_type.is_video and opts.columns_video or opts.columns_audio
-            local titles = format_table(formats, columns.title, columns.title_align_left)
+            local columns = menu_type.is_video and opts.columns_video or (menu_type.name == 'audio_tracks' and opts.columns_audio_tracks or opts.columns_audio)
+            local titles = format_table(formats, columns.title, columns.title_align_left, menu_type.name == 'audio_tracks')
 
             local hints = {}
             if columns.hint then
-                hints = format_csv(formats, columns.hint)
+                hints = format_csv(formats, columns.hint, menu_type.name == 'audio_tracks')
             end
 
             for i, format in ipairs(formats) do
@@ -1054,8 +1123,8 @@ local function ensure_menu_data_filled(formats, menu_type)
         end
     else
         if formats[1] and formats[1].label == nil then
-            local columns = menu_type.is_video and opts.columns_video or opts.columns_audio
-            local labels = format_table(formats, columns.all, columns.all_align_left)
+            local columns = menu_type.is_video and opts.columns_video or (menu_type.name == 'audio_tracks' and opts.columns_audio_tracks or opts.columns_audio)
+            local labels = format_table(formats, columns.all, columns.all_align_left, menu_type.name == 'audio_tracks')
             for i, format in ipairs(formats) do format.label = labels[i] end
         end
     end
@@ -1063,7 +1132,7 @@ end
 
 ---@param menu_type UIState
 local function loading_message(menu_type)
-    menu_type = menu_type.to_fetching
+    menu_type = menu_type.to_fetching or menu_type
     if uosc_available then
         if open_menu_state and open_menu_state == menu_type then return end
         local menu = {
@@ -1091,7 +1160,7 @@ end
 ---@param menu_type UIState
 function menu_open(menu_type)
     if not current_url then return end
-    menu_type = menu_type.to_menu
+    menu_type = menu_type.to_menu or menu_type
 
     local data = url_data[current_url]
     if not data then
@@ -1107,7 +1176,7 @@ function menu_open(menu_type)
         end
         url_data[current_url] = data
     end
-    local formats = menu_type.is_video and data.video_formats or data.audio_formats
+    local formats = menu_type.is_video and data.video_formats or (menu_type.name == 'audio_tracks' and data.audio_group_formats or data.audio_formats)
     local active_format
     if menu_type.is_video then active_format = data.video_active_id
     else active_format = data.audio_active_id end
@@ -1116,7 +1185,7 @@ function menu_open(menu_type)
 
     ensure_menu_data_filled(formats, menu_type)
     if uosc_available then uosc_menu_open(formats, active_format, menu_type)
-    else text_menu_open(formats, active_format, menu_type) end
+    elseif menu_type.name ~= 'audio_tracks' then text_menu_open(formats, active_format, menu_type) end
     open_menu_state = menu_type
 end
 
@@ -1136,7 +1205,7 @@ local function toggle_menu(menu_type)
         return
     end
 
-    if current_url == nil then
+    if current_url == nil or menu_type.name == 'audio_tracks' and not unique_audio_tracks then
         if uosc_available then
             if menu_type.is_video then
                 mp.commandv('script-binding', 'uosc/video')
@@ -1152,10 +1221,12 @@ end
 
 function video_formats_toggle() toggle_menu(states.video_menu) end
 function audio_formats_toggle() toggle_menu(states.audio_menu) end
+function audio_tracks_toggle() toggle_menu(states.audio_tracks) end
 
 -- keybind to launch menu
 mp.add_key_binding(nil, 'video_formats_toggle', video_formats_toggle)
 mp.add_key_binding(nil, 'audio_formats_toggle', audio_formats_toggle)
+mp.add_key_binding(nil, 'audio_tracks_toggle', audio_tracks_toggle)
 mp.add_key_binding(nil, 'reload', reload_resume)
 
 mp.register_event('start-file', function()
@@ -1173,15 +1244,16 @@ mp.register_event('start-file', function()
     end
 end)
 
--- run before ytdl_hook, which uses a priority of 10
-mp.add_hook('on_load', 9, function()
+-- run before ytdl_hook, which uses a priority of 10, and before youtube-parser, which uses a priority of 9
+mp.add_hook('on_load', 8, function()
     local path = mp.get_property('path')
     local data = url_data[path]
     if not (data and data.video_active_id and data.audio_active_id) then return end
-    local format = format_string(data.video_active_id, data.audio_active_id)
+    local format = format_string(data.video_active_id, not data.video_stream_has_audio and data.audio_active_id or '')
     msg.verbose('setting ytdl-format: ' .. format)
     mp.set_property('file-local-options/ytdl-format', format)
     if saved_ytdl_result then
+        if data and saved_ytdl_result.stdout then data.json_len = #saved_ytdl_result.stdout end
         mp.set_property_native('user-data/mpv/ytdl/json-subprocess-result', saved_ytdl_result)
         saved_ytdl_result = nil
     end
@@ -1247,10 +1319,10 @@ mp.register_script_message('uosc-version', function(version)
     
     mp.observe_property('idle-active', 'bool', function(_, idle)
         if idle then
-            mp.commandv('script-message-to', 'uosc', 'set-button', 'quality-menu', utils.format_json({
-                icon = '',
-                hide = true
-            })..'')
+            for _, menu_type in ipairs({"quality-menu", "audio-tracks-menu"}) do
+                mp.commandv('script-message-to', 'uosc', 'set-button', menu_type, '{"icon":"","hide":true}')
+            end
+            unique_audio_tracks = false
         end
     end)
 end)
@@ -1275,8 +1347,9 @@ mp.observe_property('user-data/mpv/ytdl/json-subprocess-result', 'native', funct
     elseif json then
         ---@type Data | nil
         local data = url_data[current_url]
-        if data == nil then
+        if data == nil or #json ~= data.json_len then
             data = process_json_string(json)
+            if data then data.json_len = #json end
             url_data[current_url] = data
             uosc_set_format_counts()
         end
