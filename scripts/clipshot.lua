@@ -42,4 +42,4 @@ end
 
 mp.add_key_binding('c',     'clipshot-subs',   clipshot('subtitles'))
 mp.add_key_binding('C',     'clipshot-video',  clipshot('video'))
-mp.add_key_binding('Alt+c', 'clipshot-window', clipshot('window'))
+mp.add_key_binding(nil,     'clipshot-window', clipshot('window'))

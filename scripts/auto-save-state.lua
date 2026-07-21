@@ -19,7 +19,7 @@ local pl_0_fname = ""
 
 local function save()
     if not need_saving then return end
-	if mp.get_property_bool("resume-playback") and (mp.get_property("time-remaining") and mp.get_property_number("time-remaining") > 5) then
+	if mp.get_property_bool("resume-playback") and (mp.get_property_number("time-remaining") or 0) > 5 and mp.get_property("metadata/ytdl_is_live") ~= "true" then
 		mp.command("write-watch-later-config")
 	end
     if mp.get_property_bool("pause") then timer:kill() end

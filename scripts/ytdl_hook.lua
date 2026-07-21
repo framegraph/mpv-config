@@ -1240,6 +1240,7 @@ local function on_load_hook(load_fail)
     local url = mp.get_property("stream-open-filename", "")
     local force = url:find("^ytdl://")
     local early = force or o.try_ytdl_first or is_whitelisted(url)
+    chapter_list = {}
     if early == load_fail then
         return
     end
