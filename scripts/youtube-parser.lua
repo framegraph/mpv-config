@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.1
+-- Ютуб-парсер для MPV плеера v0.2
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -45,8 +45,8 @@ local extractors = {
     android_vr = {
         client = {
             clientName = "ANDROID_VR",
-            clientVersion = "1.65.10",
-            userAgent = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            clientVersion = "1.63.57", -- начиная с версии 1.64.34 возможен (пока изредка) эксперимент с PO Token (ошибка 403 при открытии потока)
+            userAgent = "com.google.android.apps.youtube.vr.oculus/1.63.57 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
         },
         client_id = 28,
         yt_kids_available = false,
@@ -126,8 +126,8 @@ local extractors = {
     android_vr_reel = { -- эквивалент android_vr, но с предоставлением доп. метаданных
         client = {
             clientName = "ANDROID_VR",
-            clientVersion = "1.65.10",
-            userAgent = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            clientVersion = "1.63.57",
+            userAgent = "com.google.android.apps.youtube.vr.oculus/1.63.57 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
         },
         client_id = 28,
         yt_kids_available = false,
@@ -233,6 +233,15 @@ function try_get(obj, path) -- попытка получения узла в т�
         if not node then return nil end
     end
     return node
+end
+
+local NBSP = "\194\160" -- неразрывный пробел
+local ZWSP = "\226\128\139" -- пробел нулевой ширины (Гитхабу не нравится, когда в коде невидимые символы записаны напрямую)
+function parse_num(str)
+    return str and tonumber((str:match("[%d%s"..NBSP.."%.,]+") or ""):gsub("[%s"..NBSP.."%.,]", ""), nil) or nil
+end
+function clean_str(str) -- удаление из строки невидимых спецсимволов (для сравнения локализованных метаданных с оригинальными)
+    return str and str:gsub(ZWSP, ""):gsub("\226\128\170", ""):gsub("\226\128\172", ""):gsub("\226\129\160", "") or nil
 end
 
 function report_error(text, is_fatal)
@@ -354,7 +363,7 @@ mp.add_hook("on_load", 9, function()
                 elseif success then ok = true end
             end
         end
-        ytdl.requested_formats = select_formats(ytdl.formats)
+        ytdl.requested_formats = ok and select_formats(ytdl.formats)
         if ok and ytdl.requested_formats and #ytdl.requested_formats > 0 then
             if opts.parse_web_player_async then -- временно убираем форматы раскадровки до получения форматов с веб-плеера в более высоком качестве,
                 local i = 1                     -- чтобы не запустилась генерация эскизов в низком разрешении (при неудаче изначальные форматы вернутся)
@@ -460,7 +469,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         table.sort(streaming_fields)
         msg.debug("Received streaming data: " .. table.concat(streaming_fields, ", "))
         
-        if not checks[opts.livestream_extractor] and response.videoDetails and response.videoDetails.isLiveContent then
+        if not checks[opts.livestream_extractor] and response.videoDetails and response.videoDetails.isLive then
             msg.info("Trying to get " .. opts.livestream_extractor .. " livestream formats")
             local success = parse_yt(ytdl, youtube_id, opts.livestream_extractor, checks)
             if success ~= nil and not (success and not ytdl.hls_manifest and not ytdl.dash_manifest) then
@@ -723,7 +732,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             local src_lang, src_fmt, orig_lang
             local function poison_lang_code(code)
                 if opts.auto_subs_action == "deselect" or opts.auto_subs_action:find("skip") then
-                    code = code:gsub("%w", "​%0") -- помещаем невидимый пробел между буквами языка субтитров, чтобы предотвратить их авто-выбор плеером
+                    code = code:gsub("%w", ZWSP.."%0") -- помещаем невидимый пробел между буквами языка субтитров, чтобы предотвратить их авто-выбор плеером
                 end
                 return code
             end
@@ -794,7 +803,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         
         local meta = response.videoDetails or {}
         ytdl.title = ytdl.title or meta.title or ("YT video " .. youtube_id)
-        ytdl.description = ytdl.description or meta.shortDescription
+        ytdl.description = ytdl.description or clean_str(meta.shortDescription)
         ytdl.tags = ytdl.tags or meta.keywords
         ytdl.duration = ytdl.duration or duration
         ytdl.uploader = ytdl.uploader or meta.author
@@ -867,7 +876,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             local overlay_data = json.overlay.reelPlayerOverlayRenderer or {}
             local likes_str = try_get(overlay_data, "doubleTapLikeButton.likeButtonRenderer.likeCountWithLikeText.accessibility.accessibilityData.label")
             if likes_str and not ytdl.like_count then -- содержит точное число лайков (с учётом лайка пользователя), в виде строки
-                ytdl.like_count = tonumber((likes_str:match("[%d%s %.,]+") or ""):gsub("[%s %.,]", ""), nil)
+                ytdl.like_count = parse_num(likes_str)
                 if ytdl.like_count then
                     ytdl.like_count = math.max(ytdl.like_count - 1, 0) 
                 end
@@ -879,7 +888,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     or try_get(overlay_data, "playerOverlay."..viewmodel_path..".reelPlayerOverlayViewModel.actionBar.reelActionBarViewModel.buttonViewModels")
             for _, model in ipairs(models or {}) do
                 if model.buttonViewModel and model.buttonViewModel.accessibilityText and not ytdl.comment_count then -- опять же, число точное
-                    ytdl.comment_count = tonumber((model.buttonViewModel.accessibilityText:match("[%d%s %.,]+") or ""):gsub("[%s %.,]", ""), nil)
+                    ytdl.comment_count = parse_num(model.buttonViewModel.accessibilityText)
                     if not ytdl.comment_count and model.buttonViewModel.title and model.buttonViewModel.title:match("^%d+$") then
                         ytdl.comment_count = tonumber(model.buttonViewModel.title)
                     end
@@ -888,13 +897,12 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             if not ytdl.comment_count and string.match(try_get(overlay_data, "viewCommentsButton.buttonRenderer.text.runs[1].text") or "", "^%d+$") then
                 ytdl.comment_count = tonumber(overlay_data.viewCommentsButton.buttonRenderer.text.runs[1].text)
             elseif not ytdl.comment_count and try_get(overlay_data, "viewCommentsButton.buttonRenderer.accessibility.label") then
-                ytdl.comment_count = tonumber((overlay_data.viewCommentsButton.buttonRenderer.accessibility.label:match("[%d%s %.,]+") or ""):gsub("[%s %.,]", ""), nil)
+                ytdl.comment_count = parse_num(overlay_data.viewCommentsButton.buttonRenderer.accessibility.label)
             end
             local items = try_get(overlay_data, "metapanel."..viewmodel_path..".reelMetapanelViewModel.metadataItems")
                     or try_get(overlay_data, "playerOverlay."..viewmodel_path..".reelPlayerOverlayViewModel.metapanel.reelMetapanelViewModel.metadataItems")
             for _, item in ipairs(items or {}) do
-                local localized_title = try_get(item, "shortsVideoTitleViewModel.text.content") or ""
-                localized_title = localized_title:gsub("​", ""):gsub("‪", ""):gsub("‬", "") -- удаление невидимых спецсимволов
+                local localized_title = clean_str(try_get(item, "shortsVideoTitleViewModel.text.content")) or ""
                 if localized_title ~= "" and ytdl.title ~= localized_title then
                     ytdl.alt_title = ytdl.title
                     ytdl.title = localized_title
@@ -906,8 +914,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         for _, content in ipairs(contents or {}) do
             local element = try_get(content, "itemSectionRenderer.contents[1].elementRenderer.newElement.type.componentType.model") or {}
             if element.videoDescriptionHeaderModel then
-                local localized_title = try_get(element.videoDescriptionHeaderModel, "videoDescriptionHeader.videoTitle.content") or ""
-                localized_title = localized_title:gsub("​", ""):gsub("‪", ""):gsub("‬", "")
+                local localized_title = clean_str(try_get(element.videoDescriptionHeaderModel, "videoDescriptionHeader.videoTitle.content")) or ""
                 if localized_title ~= "" and ytdl.title ~= localized_title then
                     ytdl.alt_title = ytdl.title
                     ytdl.title = localized_title
@@ -917,8 +924,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     ytdl.upload_date_text = date_str:gsub("Published on ", ""):gsub("Дата публикации: ", "")
                 end
             elseif element.descriptionBodyModel then
-                local localized_description = try_get(element.descriptionBodyModel, "renderer.descriptionBodyText.elementsAttributedString.content") or ""
-                localized_description = localized_description:gsub("​", ""):gsub("‪", ""):gsub("‬", "")
+                local localized_description = clean_str(try_get(element.descriptionBodyModel, "renderer.descriptionBodyText.elementsAttributedString.content")) or ""
                 if localized_description ~= "" and ytdl.description ~= localized_description then
                     ytdl.alt_description = ytdl.description -- у yt-dlp нет такого поля, но оригинальное описание тоже может быть полезно
                     ytdl.description = localized_description
@@ -928,7 +934,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                 for _, frag in ipairs(content.slimVideoMetadataSectionRenderer.contents[1].slimVideoDescriptionRenderer.description.runs) do
                     if frag.text then table.insert(desc_frags, frag.text) end
                 end
-                local localized_description = table.concat(desc_frags, ""):gsub("​", ""):gsub("‪", ""):gsub("‬", "")
+                local localized_description = clean_str(table.concat(desc_frags, ""))
                 if localized_description ~= "" and ytdl.description ~= localized_description then
                     ytdl.alt_description = ytdl.description
                     ytdl.description = localized_description
