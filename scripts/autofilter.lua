@@ -534,6 +534,69 @@ elseif o.use_system_proxy >= 1 then
     end
 end
 
+
+local update_running = false
+function update_parser()
+    local script_permalink = "https://raw.githubusercontent.com/framegraph/mpv-config/refs/heads/master/scripts/youtube-parser.lua"
+    local ver_pattern = "[^\r\n]* v([%d%.]+)"
+    -- функция также позволяет установить парсер с нуля, который теоретически может затереться при обновлении
+    -- этот скрипт также необходим для работы парсера, не требует обновлений и идёт вместе со сборкой
+    local ytdl_hook_path = mp.command_native({"expand-path", "~~/scripts/ytdl_hook.lua"}) or ""
+    local f = io.open(ytdl_hook_path, "r")
+    if f then
+        f:close()
+    else
+        mp.osd_message("Сборка повреждена - невозможно обновить Ютуб-парсер. Попробуйте переустановить её", 5)
+        return
+    end
+    if update_running then
+        mp.osd_message("Обновление Ютуб-парсера уже запущено!")
+        return
+    end
+    
+    local args = { "curl", "--silent", "--show-error", "--fail", "--location", "--connect-timeout", "10", "--max-time", "30" }
+    local proxy = (mp.get_property_native("ytdl-raw-options") or {}).proxy or mp.get_property("http-proxy")
+    if proxy and proxy ~= "" then -- curl игнорирует настройки системного прокси
+        table.insert(args, "--proxy")
+        table.insert(args, proxy)
+    end
+    table.insert(args, script_permalink)
+    mp.osd_message("Скачивается обновление Ютуб-парсера...", 30)
+    update_running = true
+    
+    mp.command_native_async({name="subprocess", capture_stdout=true, playback_only=false, args=args}, function(success, res)
+        update_running = false
+        if success and res.status == 0 and #res.stdout > 0 then
+            local parser_path = ytdl_hook_path:gsub("ytdl_hook%.lua$", "youtube-parser.lua")
+            local old_ver
+            local new_ver = string.match(res.stdout, ver_pattern)
+            local fr = io.open(parser_path, "r")
+            if fr then
+                old_ver = string.match(fr:read("*l") or "", ver_pattern)
+                fr:close()
+            end
+            if not new_ver or old_ver == new_ver then
+                mp.osd_message("Уже установлена последняя версия парсера" .. (old_ver and string.format(" (v%s)", old_ver) or ""))
+            else
+                local fw_tmp = io.open(parser_path.."_tmp", "w")
+                if fw_tmp then
+                    fw_tmp:write(res.stdout)
+                    fw_tmp:close()
+                    os.remove(parser_path) -- плеер считывает скрипты лишь при запуске и позволяет их редактировать, когда запущен
+                    if os.rename(parser_path.."_tmp", parser_path) then
+                        local ver_part = old_ver and string.format("(v%s -> v%s)", old_ver, new_ver) or ("до версии " .. new_ver)
+                        mp.osd_message("Ютуб-парсер успешно обновлён " .. ver_part .. "!\nИзменения применятся после перезапуска плеера", 7)
+                        return
+                    end
+                end
+                mp.osd_message("Не удалось записать новую версию парсера, попробуйте ещё раз после перезапуска плеера", 5)
+            end
+        else
+            mp.osd_message("Произошла ошибка при скачивании парсера, подробности в консоли плеера", 5)
+        end
+    end)
+end
+
 mp.register_script_message("manualdeint", manualdeint)
 mp.register_script_message("safe-toggle-fullscreen", toggle_fs) -- отключение перехода в полноэкранный режим при двойных кликах в нижней части экрана с элементами управления плеером uosc
                                                                 -- на вход число пикселей от низа окна плеера, при кликах в области которых не переходить в полноэкранный режим
@@ -543,3 +606,4 @@ mp.register_script_message("swap-subtitles", swap_subs) -- поменять ме
 mp.register_script_message("add-color-temp", change_temp) -- изменение цветовой температуры видео на переданное число Кельвинов (работает только при --vo=gpu-next)
 mp.register_script_message("toggle-cache-mode", toggle_cache_mode) -- переключение между кэшированием целиком на диск и обратно (можно прямо во время воспроизведения)
 mp.register_script_message("speed-scaled-seek", speed_scaled_seek) -- относительная перемотка с учётом скорости воспроизведения
+mp.register_script_message("update-youtube-parser", update_parser) -- обновление моего Ютуб-парсера из сборки (скачивание актуальной версии напрямую из репозитория)
