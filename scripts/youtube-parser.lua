@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.2
+-- Ютуб-парсер для MPV плеера v0.3
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -170,7 +170,7 @@ function get_innertube_api_route(extractor, get_config)
     elseif extractor.api_route == "player" then
         return innertube_api .. "/player?prettyPrint=false"
     elseif extractor.api_route == "reel" then
-        return innertube_api .. "/reel/reel_item_watch?fields=playerResponse,overlay,engagementPanels&prettyPrint=false"
+        return innertube_api .. "/reel/reel_item_watch?fields=responseContext,playerResponse,overlay,engagementPanels&prettyPrint=false"
     end
 end
 
@@ -416,7 +416,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         table.insert(args, h)
     end
     table.insert(args, "--data")
-    table.insert(args, get_innertube_request(extractors[extractor_name], youtube_id))
+    table.insert(args, get_innertube_request(extractors[extractor_name], get_config and nil or youtube_id))
     table.insert(args, "--compressed") -- если используемый curl не поддерживает сжатие, оно просто не будет запрашиваться
     
     local ytdl_opts = mp.get_property_native("ytdl-raw-options") or {}
