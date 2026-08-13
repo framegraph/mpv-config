@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.3
+-- Ютуб-парсер для MPV плеера v0.4
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -57,9 +57,10 @@ local extractors = {
         visitor_id_required = true,
         api_route = "player",
     },
-    -- нестабилен, открываются только HLS потоки, причём не всегда (хотя у меня работают ~90% времени):
+    -- нестабилен, открываются только HLS потоки, причём не всегда:
     -- парсинг проходит успешно, но при попытке открыть полученный медиапоток возникает ошибка 403 Forbidden
     -- (эксперимент с обязательным требованием предоставить PO Token, которые парсер не поддерживает)
+    -- также возможен эксперимент с отсутствием выдачи единственно воспроизводимого HLS манифеста
     ios = {
         client = {
             clientName = "IOS",
@@ -88,7 +89,7 @@ local extractors = {
         visitor_id_required = true,
         api_route = "player",
     },
-    -- в последнее время работает нестабильно (эксперимент с PO Token)
+    -- теперь стал всегда требовать PO Token (кроме качества 360p и HLS трансляций, которые воспроизводит стабильно)
     android_reel = { -- также поддерживает извлечение дополнительных метаданных (дата публикации, число лайков, комментариев...)
         client = {
             clientName = "ANDROID",
@@ -101,9 +102,10 @@ local extractors = {
         premium_available = false,
         dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости"
         visitor_id_required = false,
+        adaptive_formats_unplayable = true,
         api_route = "reel",
     },
-    -- в отличие от iOS даёт также воспроизводимые DASH потоки, но они тоже открываются не всегда (возможен эксперимент с PO Token)
+    -- в отличие от iOS даёт воспроизводимые DASH потоки и стабильно возвращает HLS, но они тоже открываются не всегда (возможен эксперимент с PO Token)
     ios_reel = {
         client = {
             clientName = "IOS",
@@ -453,9 +455,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
     if json and (json.streamingData or (json.playerResponse and json.playerResponse.streamingData)) then
         local response = json.playerResponse or json
         local manifest
-        local vtrack = nil
-        local atrack = nil
-        local prem_track, pref_dub, dubs
+        local prem_track, dubs
         local ai_qualities = {}
         local sabr_warned = false
         local streaming_fields = {}
@@ -470,6 +470,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         msg.debug("Received streaming data: " .. table.concat(streaming_fields, ", "))
         
         if not checks[opts.livestream_extractor] and response.videoDetails and response.videoDetails.isLive then
+            ytdl.is_live = true
             msg.info("Trying to get " .. opts.livestream_extractor .. " livestream formats")
             local success = parse_yt(ytdl, youtube_id, opts.livestream_extractor, checks)
             if success ~= nil and not (success and not ytdl.hls_manifest and not ytdl.dash_manifest) then
@@ -494,7 +495,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         local no_adaptive = true
         local fhd, vp9, qhd
         for _, form in ipairs(response.streamingData.adaptiveFormats) do
-            if form.url and not form.url:find("source=yt_live_broadcast") and not extractors[extractor_name].adaptive_formats_unplayable then
+            if form.url and not form.url:find("source=yt_%a+_broadcast") and not extractors[extractor_name].adaptive_formats_unplayable then
                 if not form.legacy then
                     no_adaptive = false
                 end
@@ -532,6 +533,14 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         end
         
         if manifest then
+            local function extract_filesize(url) -- в HLS метаданных содержится завышенный (пиковый?) битрейт, но настоящий можно вычислить из url параметров
+                local clen, dur = url:lower():gsub("%%3d", "="):gsub("%%3b", ";"):match("/clen=(%d+);dur=([%d%.]+)")
+                if tonumber(clen or "") and (tonumber(dur or "") or 0) > 0 then
+                    local true_bitrate = math.floor(tonumber(clen) / tonumber(dur) * 8)
+                    return clen, true_bitrate
+                end
+            end
+            
             local next_is_url = false
             for line in manifest:gmatch("[^\r\n]+") do
                 if next_is_url then
@@ -541,6 +550,11 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     else
                         response.streamingData.adaptiveFormats[#response.streamingData.adaptiveFormats].url = line
                         response.streamingData.adaptiveFormats[#response.streamingData.adaptiveFormats].itag = line:match("/itag/(%d+)/")
+                        local filesize_str, true_bitrate = extract_filesize(line)
+                        if filesize_str and true_bitrate then
+                            response.streamingData.adaptiveFormats[#response.streamingData.adaptiveFormats].contentLength = filesize_str
+                            response.streamingData.adaptiveFormats[#response.streamingData.adaptiveFormats].averageBitrate = true_bitrate
+                        end
                     end
                     next_is_url = false
                 else
@@ -571,6 +585,10 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                         bitrate = "48000"
                         mime = 'codecs="mp4a"'
                     end
+                    local filesize_str, true_bitrate = extract_filesize(url or "")
+                    if true_bitrate then
+                        bitrate = true_bitrate
+                    end
                     if url or next_is_url then
                         table.insert(response.streamingData.adaptiveFormats, {
                             hls = true,
@@ -583,6 +601,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                             fps = tonumber(fps),
                             mimeType = mime and mime:lower() or nil,
                             averageBitrate = tonumber(bitrate),
+                            contentLength = filesize_str,
                             audioQuality = is_ext_audio and (itag == "234" and "medium" or "low") or nil,
                             language = lang and (lang .. (name and name:find("-auto") and "-auto" or "")) or nil
                         })
@@ -656,7 +675,9 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             for _, existed in ipairs(ytdl.formats) do
                 if existed.format_id == itag then duplicate = true end
             end
-            if form.url and not form.url:find("source=yt_live_broadcast") and not duplicate and not (extractors[extractor_name].adaptive_formats_unplayable and not form.hls) then
+            if form.url and not form.url:find("source=yt_%a+_broadcast") and not duplicate 
+                    and (not extractors[extractor_name].adaptive_formats_unplayable or form.hls or form.legacy) 
+            then
                 local mime = form.mimeType or ""
                 local is_video = mime:match("^video") or form.fps or form.height -- может также содержать аудиодорожку
                 local is_audio = (mime:match("^audio") or form.audioQuality) and not is_video
@@ -1013,11 +1034,11 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             msg.warn(string.format("Attempt failed after %.3f s, %s", mp.get_time() - start, err))
             msg.info("Trying again with received visitor data")
             return parse_yt(ytdl, youtube_id, extractor_name, checks)
-        elseif status == "LOGIN_REQUIRED" and vdata_is_stale() then -- не исключено, что, ошибка из-за того, что visitorData давно не обновлялась
-            clear_visitor_data()                                    -- на всякий случай, лучше сбросить её, чтобы получить новую при следующей попытке
+        elseif status == "LOGIN_REQUIRED" then -- не исключено, что, ошибка из-за того, что visitorData больше недействительна
+            clear_visitor_data()               -- на всякий случай, лучше сбросить её, чтобы получить новую при следующей попытке
         end
         
-        if #ytdl.formats > 0 then -- дополнительный парсинг (например, для получения премиум потока)
+        if #ytdl.formats > 0 or ytdl.is_live then -- дополнительный парсинг (например, для получения премиум потока)
             msg.warn(string.format("Sub-parsing as %s failed after %.3f s, %s", extractor_name, mp.get_time() - start, err))
         else
             report_error("Parsing failed, " .. err)
