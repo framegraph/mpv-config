@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.4
+-- Ютуб-парсер для MPV плеера v0.5
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -8,7 +8,7 @@ local msg = require('mp.msg')
 
 -- подробнее о настройках в script-opts/youtube-parser.conf
 local opts = {
-    extractor = "default", -- android_vr, ios, visionos, android_reel, ios_reel, android_vr_reel, visionos_reel, web
+    extractor = "default", -- android_vr, ios, visionos, android_reel, ios_reel, android_vr_reel, visionos_reel, android_testsuite, ios_testsuite, web
     parse_hls_manifests = "auto", -- no | auto | yes
     parse_web_player_async = false,
     target_resolution = 1440,
@@ -23,7 +23,7 @@ local opts = {
     translation_lang = "",
     auto_subs_action = "deselect", -- skip | skip-translated | deselect | none
     premium_extractor = "",
-    yt_kids_extractor = "ios_reel",
+    yt_kids_extractor = "ios_testsuite",
     dubbed_tracks_extractor = "",
     livestream_extractor = "",
     geoblock_proxy = "",
@@ -34,7 +34,7 @@ local opts = {
 options.read_options(opts, "youtube-parser")
 
 
-local initial_path, interrupt_data, fallback_running
+local initial_path, interrupt_data, fallback_running, force_vdata
 local storyboard_fmts = {}
 local cache = {
     visitor_data = "",
@@ -42,10 +42,11 @@ local cache = {
 }
 
 local extractors = {
+    -- перестал работать: теперь всегда требует войти в аккаунт, либо предоставить PO Token
     android_vr = {
         client = {
             clientName = "ANDROID_VR",
-            clientVersion = "1.63.57", -- начиная с версии 1.64.34 возможен (пока изредка) эксперимент с PO Token (ошибка 403 при открытии потока)
+            clientVersion = "1.63.57", -- начиная с версии 1.64.34 любой формат (даже 360p itag-18) при открытии возвращает ошибку 403 (требует PO Token)
             userAgent = "com.google.android.apps.youtube.vr.oculus/1.63.57 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
         },
         client_id = 28,
@@ -100,7 +101,7 @@ local extractors = {
         client_id = 3,
         yt_kids_available = true,
         premium_available = false,
-        dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости"
+        dubbed_tracks_available = false,
         visitor_id_required = false,
         adaptive_formats_unplayable = true,
         api_route = "reel",
@@ -125,6 +126,7 @@ local extractors = {
         visitor_id_required = false,
         api_route = "reel",
     },
+    -- также перестал работать
     android_vr_reel = { -- эквивалент android_vr, но с предоставлением доп. метаданных
         client = {
             clientName = "ANDROID_VR",
@@ -146,9 +148,43 @@ local extractors = {
         client_id = 101,
         yt_kids_available = false,
         premium_available = true,
-        dubbed_tracks_available = true,
+        dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости"
         visitor_id_required = true,
         api_route = "reel",
+    },
+    android_testsuite = { -- полностью рабочий Android экстрактор, пока не подверженный экспериментам
+        -- также примечателен тем, что не накладывает троттлинг при загрузке DASH потоков запросами, не разбитыми на range request-ы <= 10 МБ
+        client = {
+            clientName = "ANDROID",
+            clientVersion = "20.26.46",
+            androidSdkVersion = 30,
+            userAgent = "com.google.android.youtube/20.26.46 (Linux; U; Android 11) gzip"
+        },
+        client_id = 3,
+        yt_kids_available = true,
+        premium_available = false,
+        dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости" и многоканальный (surround) звук
+        visitor_id_required = false,
+        api_route = "player", -- не работает в reel-исполнении
+        player_params = "2AMB"
+    },
+    ios_testsuite = { -- полностью рабочий iOS экстрактор, пока не подверженный экспериментам (и также на накладывающий троттлинг)
+        client = {
+            clientName = "IOS",
+            clientVersion = "21.02.3",
+            deviceMake = "Apple",
+            deviceModel = "iPhone16,2",
+            osName = "iPhone",
+            osVersion = "18.3.2.22D82",
+            userAgent = "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)" -- прослеживается та же вариативность
+        },
+        client_id = 5,
+        yt_kids_available = true,
+        premium_available = true,
+        dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости"
+        visitor_id_required = false,
+        api_route = "player", -- не работает в reel-исполнении
+        player_params = "2AMB"
     },
     -- только для извлечения метаданных, предоставляет только SABR потоки и формат 360p, требующий JavaScript расшифровки
     web = {
@@ -192,6 +228,7 @@ function get_innertube_request(extractor, video_id)
     tab.racyCheckOk = true
     tab.videoId = video_id
     tab.playbackContext = { contentPlaybackContext = {html5Preference = "HTML5_PREF_WANTS", signatureTimestamp = 20648} }
+    tab.params = extractor.player_params or nil
     local req_str = utils.format_json(req)
     return req_str
 end
@@ -214,8 +251,8 @@ function get_innertube_api_headers(extractor)
         table.insert(headers, "X-Youtube-Client-Name: "..extractor.client_id)
         table.insert(headers, "X-Youtube-Client-Version: "..extractor.client.clientVersion)
     end
-    if extractor.visitor_id_required and get_visitor_data() then
-        msg.debug("Passing visitor data header according to extractor requirements")
+    if (extractor.visitor_id_required or force_vdata) and get_visitor_data() then
+        msg.debug("Passing visitor data header according to " .. (not force_vdata and "extractor requirements" or "global override"))
         table.insert(headers, "X-Goog-Visitor-Id: " .. get_visitor_data())
     end
     return headers
@@ -305,6 +342,18 @@ if opts.parse_hls_manifests == "true" then opts.parse_hls_manifests = "yes" end
 if opts.parse_hls_manifests == "false" then opts.parse_hls_manifests = "no" end
 if opts.skip_vp9 or opts.target_resolution < 1080 or opts.parse_hls_manifests == "no" then
     opts.premium_extractor = ""
+end
+if opts.extractor == "default" then
+    -- android_vr_reel использовался в сборке для получения максимального (для HLS) 4-часового таймшифта на прямых трансляциях
+    -- поскольку он перестал работать и пока нет других экстракторов с таким таймшифтом, убираю его до лучших времён
+    if opts.livestream_extractor:lower():find("android_vr") then
+        opts.livestream_extractor = ""
+    end
+    -- появился более стабильный ios_testsuite экстрактор, лучше подходящий на место дефолтного для открытия YT Kids роликов:
+    -- он возращает ровно те же потоки, что и ios_reel, разве что извлекает меньше метаданных
+    if opts.yt_kids_extractor == "ios_reel" then
+        opts.yt_kids_extractor = "ios_testsuite"
+    end
 end
 opts.extractor = opts.extractor:lower()
 opts.cache_path = mp.command_native({"expand-path", opts.cache_path})
@@ -400,7 +449,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
     checks[extractor_name] = true
     
     local vdata_missing = false
-    if not get_config and not async_cb and extractors[extractor_name].visitor_id_required and not get_visitor_data() then
+    if not get_config and not async_cb and (extractors[extractor_name].visitor_id_required or force_vdata) and not get_visitor_data() then
         msg.debug("Visitor data is missing, trying to get it from client config")
         local status = parse_yt(ytdl, youtube_id, extractor_name, checks, true)
         if status == false then
@@ -469,7 +518,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         table.sort(streaming_fields)
         msg.debug("Received streaming data: " .. table.concat(streaming_fields, ", "))
         
-        if not checks[opts.livestream_extractor] and response.videoDetails and response.videoDetails.isLive then
+        if not checks[opts.livestream_extractor] and extractors[opts.livestream_extractor] and response.videoDetails and response.videoDetails.isLive then
             ytdl.is_live = true
             msg.info("Trying to get " .. opts.livestream_extractor .. " livestream formats")
             local success = parse_yt(ytdl, youtube_id, opts.livestream_extractor, checks)
@@ -1028,12 +1077,19 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             msg.warn(string.format("Attempt failed after %.3f s, %s", mp.get_time() - start, err))
             msg.info("Trying " .. opts.yt_kids_extractor .. " extractor fallback")
             return parse_yt(ytdl, youtube_id, opts.yt_kids_extractor, checks)
-        elseif status == "LOGIN_REQUIRED" and vdata_missing and not vdata_is_stale() then
+        elseif status == "LOGIN_REQUIRED" and (vdata_missing or not (extractors[extractor_name].visitor_id_required or force_vdata)) and not vdata_is_stale() then
             -- не получилось извлечь visitorData из конфига, получена ожидаемая ошибка, зато удалось извлечь прямо из текущего ответа,
             -- а значит можно попробовать повторить парсинг уже с требуемым заголовком
             msg.warn(string.format("Attempt failed after %.3f s, %s", mp.get_time() - start, err))
             msg.info("Trying again with received visitor data")
-            return parse_yt(ytdl, youtube_id, extractor_name, checks)
+            force_vdata = true
+            local success = parse_yt(ytdl, youtube_id, extractor_name, checks)
+            if extractors[extractor_name].visitor_id_required or not success then
+                -- на некоторых IP с "подозрительной активностью" Ютуб выдаёт эту ошибку даже для клиентов, обычно не требующих visitorData
+                -- поэтому, если парсинг с этим заголовком вдруг удастся, передаём его и дальше до перезапуска плеера как ставший обязательным
+                force_vdata = false
+            end
+            return success
         elseif status == "LOGIN_REQUIRED" then -- не исключено, что, ошибка из-за того, что visitorData больше недействительна
             clear_visitor_data()               -- на всякий случай, лучше сбросить её, чтобы получить новую при следующей попытке
         end
@@ -1103,7 +1159,7 @@ function add_storyboard_formats(ytdl, sb_spec, duration)
             local width, height, frame_count, cols, rows = counts[1], counts[2], counts[3], counts[4], counts[5]
             local N, sigh = args[7], args[8]
             
-            local url = base_url:gsub("$L", tostring(#spec - 1 - i)):gsub("$N", N) .. "&sigh=" .. sigh
+            local url = base_url:gsub("$L", tostring(#spec - 1 - i)):gsub("$N", N) .. (base_url:find('?') and '&' or '?') .. "sigh=" .. sigh
             local fragment_count = frame_count / (cols * rows)
             local fragment_duration = duration / fragment_count
             local fragments = {}
@@ -1160,6 +1216,7 @@ function parse_microformat(ytdl, microformat)
             ytdl.was_live = true
         end
     end
+    ytdl.view_count = tonumber(microformat.viewCount or "") or ytdl.view_count
     ytdl.like_count = tonumber(microformat.likeCount or "") or ytdl.like_count
     ytdl.webpage_url = microformat.canonicalUrl or ytdl.webpage_url
 end
