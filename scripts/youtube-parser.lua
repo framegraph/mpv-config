@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.5
+-- Ютуб-парсер для MPV плеера v0.6
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -82,6 +82,7 @@ local extractors = {
         client = { -- Ютуб клиент для visionOS https://apps.apple.com/us/app/youtube-for-visionos/id6745572359
             clientName = "VISIONOS",
             clientVersion = "1.01",
+            userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
         },
         client_id = 101,
         yt_kids_available = false,
@@ -140,10 +141,11 @@ local extractors = {
         visitor_id_required = true,
         api_route = "reel",
     },
-    visionos_reel = { -- эквивалент visionos, но с предоставлением доп. метаданных
+    visionos_reel = { -- visionos с предоставлением доп. метаданных (хотя, в отличие от него, начал иногда выдавать потоки с 403 Forbidden)
         client = {
             clientName = "VISIONOS",
             clientVersion = "1.01",
+            userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
         },
         client_id = 101,
         yt_kids_available = false,
@@ -199,7 +201,7 @@ local extractors = {
         api_route = "player",
     },
 }
-local default_extractor = "visionos_reel"
+local default_extractor = "ios_testsuite"
 
 local innertube_api = "https://www.google.com/youtubei/v1"
 function get_innertube_api_route(extractor, get_config)
