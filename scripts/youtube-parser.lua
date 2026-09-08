@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.6
+-- Ютуб-парсер для MPV плеера v0.7
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -113,12 +113,10 @@ local extractors = {
             clientName = "IOS",
             clientVersion = "21.02.3",
             deviceMake = "Apple",
-            deviceModel = "iPhone16,2",
-            osName = "iPhone",  -- необходимо для получения аудиодорожек в кодеке Opus
-            osVersion = "18.3.2.22D82",
-            -- прослеживается вариативность: если передавать iOS user agent, макс. качество будет 4K HDR
-            -- а если не передавать, будет доступно 8K качество, но HDR потоки возвращаться не будут
-            userAgent = "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+            deviceModel = "iPad16,6",
+            osName = "iPadOS",  
+            osVersion = "18.3.2.22D82", -- необходимо для получения аудиодорожек в кодеке Opus
+            userAgent = "com.google.ios.youtube/21.02.3 (iPad; CPU OS 16_7_16 like Mac OS X)" -- позволяет одновременно получать 8K и HDR потоки
         },
         client_id = 5,
         yt_kids_available = true,
@@ -175,10 +173,10 @@ local extractors = {
             clientName = "IOS",
             clientVersion = "21.02.3",
             deviceMake = "Apple",
-            deviceModel = "iPhone16,2",
-            osName = "iPhone",
+            deviceModel = "iPad16,6",
+            osName = "iPadOS",
             osVersion = "18.3.2.22D82",
-            userAgent = "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)" -- прослеживается та же вариативность
+            userAgent = "com.google.ios.youtube/21.02.3 (iPad; CPU OS 16_7_16 like Mac OS X)"
         },
         client_id = 5,
         yt_kids_available = true,
@@ -282,7 +280,7 @@ function parse_num(str)
     return str and tonumber((str:match("[%d%s"..NBSP.."%.,]+") or ""):gsub("[%s"..NBSP.."%.,]", ""), nil) or nil
 end
 function clean_str(str) -- удаление из строки невидимых спецсимволов (для сравнения локализованных метаданных с оригинальными)
-    return str and str:gsub(ZWSP, ""):gsub("\226\128\170", ""):gsub("\226\128\172", ""):gsub("\226\129\160", "") or nil
+    return str and str:gsub(ZWSP, ""):gsub("\226\128[\142\143\170-\174]", ""):gsub("\226\129\160", "") or nil
 end
 
 function report_error(text, is_fatal)
@@ -609,7 +607,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     end
                     next_is_url = false
                 else
-                    local url, itag, width, height, fps, mime, is_ext_audio, is_hdr_fmt, name, lang, bitrate
+                    local url, itag, width, height, fps, mime, is_ext_audio, video_range, name, lang, bitrate
                     -- пропускаем субтитры по протоколу HLS - даже iOS предоставляет воспроизводимые субтитры по прямой ссылке
                     if line:match("^#EXT%-X%-MEDIA") and line:find("TYPE=AUDIO") then
                         url = line:match('URI="([^"]+)')
@@ -627,7 +625,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                         fps = line:match("FRAME%-RATE=(%d+)")
                         bitrate = line:match("BANDWIDTH=(%d+)")
                         mime = line:match('CODECS="[^"]+"')
-                        is_hdr_fmt = line:match('VIDEO%-RANGE=PQ')
+                        video_range = line:match('VIDEO%-RANGE=(%w+)')
                     end
                     if itag == "234" and not bitrate then -- эквивалент формата 140 в DASH, то есть AAC (mp4a) ~128 кбит/с
                         bitrate = "128000"
@@ -643,7 +641,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     if url or next_is_url then
                         table.insert(response.streamingData.adaptiveFormats, {
                             hls = true,
-                            isHdr = is_hdr_fmt ~= nil,
+                            isHdr = (video_range == "PQ" or video_range == "HLG"),
                             qualityLabel = name,
                             url = url,
                             itag = itag,
@@ -707,8 +705,12 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                         or (form.qualityLabel and form.qualityLabel:lower():find("original")) 
                     then q = q + 10 end
                 if mime:find("opus") then
-                    q = q + 2
+                    q = q + 4
                 elseif mime:find("mp4a") or mime:find("aac") then
+                    q = q + 3
+                elseif mime:find("ec%-3") then
+                    q = q + 2
+                elseif mime:find("ac%-3") then
                     q = q + 1
                 end
             end
@@ -777,7 +779,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     asr = form.audioSampleRate and tonumber(form.audioSampleRate),
                     audio_channels = form.audioChannels,
                     language = form.language,
-                    downloader_options = (not form.legacy and not form.hls) and { http_chunk_size = 10 * 2^20 } or nil,
+                    downloader_options = (not form.legacy and not form.hls and not form.url:find("ratebypass=yes")) and { http_chunk_size = 10 * 2^20 } or nil,
                     
                     projection_type = (is_video and form.projectionType and form.projectionType ~= "RECTANGULAR") and form.projectionType:lower() or nil,
                     byte_ranges = (form.initRange and form.indexRange) and {
