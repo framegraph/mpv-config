@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v0.7
+-- Ютуб-парсер для MPV плеера v1.0
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -11,6 +11,7 @@ local opts = {
     extractor = "default", -- android_vr, ios, visionos, android_reel, ios_reel, android_vr_reel, visionos_reel, android_testsuite, ios_testsuite, web
     parse_hls_manifests = "auto", -- no | auto | yes
     parse_web_player_async = false,
+    split_channel_by_tabs = true,
     target_resolution = 1440,
     skip_av1 = true,
     skip_vp9 = false,
@@ -20,16 +21,20 @@ local opts = {
     prefer_drc = false,
     sub_format = "vtt", -- vtt | srt | srv3 | ttml
     metadata_lang = "en",
-    translation_lang = "",
+    translation_lang = "", -- для обратной совместимости; разделено на 2 опции ниже
+    autosub_lang = "auto",
+    audio_lang = "auto",
     auto_subs_action = "deselect", -- skip | skip-translated | deselect | none
     premium_extractor = "",
     yt_kids_extractor = "ios_testsuite",
     dubbed_tracks_extractor = "",
     livestream_extractor = "",
     geoblock_proxy = "",
+    proxy_when_unsure = false,
     curl_path = [[curl]],
     cache_path = [[~~/youtube_parser_cache.json]],
     osd_errors = false,
+    show_parsing_progress = true,
 }
 options.read_options(opts, "youtube-parser")
 
@@ -190,7 +195,7 @@ local extractors = {
     web = {
         client = {
             clientName = "WEB",
-            clientVersion = "2.20260114.08.00",
+            clientVersion = "2.20260911.08.00"
         },
         client_id = 1,
         yt_kids_available = true,
@@ -200,19 +205,34 @@ local extractors = {
     },
 }
 local default_extractor = "ios_testsuite"
+local playlist_extractor = "web"
+
+local playlist_types = {
+    normal = { prefix = "", lsub = 0, path = nil, api_route = "browse" },
+    uploads = { prefix = "UU", lsub = 2, path = nil, api_route = "browse" },
+    videos = { prefix = "UULF", lsub = 2, path = "/videos", api_route = "browse" },
+    -- у этого плейлиста сейчас сломана пагинация (даже на сайте Ютуба он не подгружается дальше первых 100 элементов),
+    -- поэтому приходится использовать альтернативный способ, не подверженный этой проблеме
+    shorts = { prefix = "UUSH", lsub = 2, path = "/shorts", api_route = "next_pl" },
+    live = { prefix = "UULV", lsub = 2, path = "/streams", api_route = "browse" },
+}
 
 local innertube_api = "https://www.google.com/youtubei/v1"
-function get_innertube_api_route(extractor, get_config)
-    if get_config then
-        return innertube_api .. "/config?prettyPrint=false"
+function get_innertube_api_route(extractor, custom_route)
+    if custom_route then
+        return innertube_api .. custom_route .. (custom_route:find('?') and "" or "?prettyPrint=false")
     elseif extractor.api_route == "player" then
         return innertube_api .. "/player?prettyPrint=false"
     elseif extractor.api_route == "reel" then
         return innertube_api .. "/reel/reel_item_watch?fields=responseContext,playerResponse,overlay,engagementPanels&prettyPrint=false"
+    elseif extractor.api_route == "browse" then
+        return innertube_api .. "/browse?prettyPrint=false"
+    elseif extractor.api_route == "next_pl" then
+        return innertube_api .. "/next?prettyPrint=false&fields=contents.twoColumnWatchNextResults.playlist,continuationContents"
     end
 end
 
-function get_innertube_request(extractor, video_id)
+function get_innertube_request(extractor, custom_fields)
     local req = {}
     req.context = {}
     req.context.client = extractor.client
@@ -226,9 +246,12 @@ function get_innertube_request(extractor, video_id)
     local tab = extractor.api_route == "reel" and req.playerRequest or req
     tab.contentCheckOk = true
     tab.racyCheckOk = true
-    tab.videoId = video_id
     tab.playbackContext = { contentPlaybackContext = {html5Preference = "HTML5_PREF_WANTS", signatureTimestamp = 20648} }
     tab.params = extractor.player_params or nil
+    for k, v in pairs(custom_fields or {}) do
+        tab[k] = v
+    end
+    
     local req_str = utils.format_json(req)
     return req_str
 end
@@ -281,6 +304,16 @@ function parse_num(str)
 end
 function clean_str(str) -- удаление из строки невидимых спецсимволов (для сравнения локализованных метаданных с оригинальными)
     return str and str:gsub(ZWSP, ""):gsub("\226\128[\142\143\170-\174]", ""):gsub("\226\129\160", "") or nil
+end
+
+function parse_time(timetext)
+    if timetext and timetext:match("^%d+:%d%d:%d%d") then
+        local h, m, s = timetext:match("^(%d+):(%d%d):(%d%d)")
+        return h * 3600 + m * 60 + s
+    elseif timetext and timetext:match("^%d+:%d%d") then
+        local m, s = timetext:match("^(%d+):(%d%d)")
+        return m * 60 + s
+    end
 end
 
 function report_error(text, is_fatal)
@@ -361,16 +394,38 @@ opts.cache_path = mp.command_native({"expand-path", opts.cache_path})
 function sanity_check_extractor(opt, check, msg)
     opts[opt] = opts[opt]:lower()
     if not extractors[opts[opt]] and (opts[opt] ~= "") then
-        report_error(string.format("Unknown extractor '%s'!", opts[opt]))
+        msg.warn(string.format("Unknown extractor '%s'!", opts[opt]))
         opts[opt] = ""
     elseif check and opts[opt] ~= "" and not extractors[opts[opt]][check] then
-        report_error(string.format("'%s' %s, disabling", opts[opt], msg))
+        msg.warn(string.format("'%s' %s, disabling", opts[opt], msg))
         opts[opt] = ""
     end
 end
 sanity_check_extractor("premium_extractor", "premium_available", "doesn't return premium format")
 sanity_check_extractor("dubbed_tracks_extractor", "dubbed_tracks_available", "doesn't return dubbed tracks")
 sanity_check_extractor("yt_kids_extractor", "yt_kids_available", "doesn't support YT Kids videos")
+
+function process_lang_opt(opt, lang_prop)
+    opts[opt] = opts[opt]:lower()
+    if opts[opt] == "auto" then
+        local mpv_pref = mp.get_property(lang_prop) or ""
+        for lang in mpv_pref:gmatch("[^,]+") do
+            if lang:match("^%a%a$") or lang:match("^%a%a%-") then
+                opts[opt] = lang:sub(1, 2)
+                break
+            end
+        end
+        if opts[opt] == "auto" then opts[opt] = "" end
+        msg.debug(string.format("Setting %s opt to '%s'", opt, opts[opt]))
+    end
+end
+if opts.translation_lang ~= "" and opts.autosub_lang == "auto" and opts.audio_lang == "auto" then
+    opts.autosub_lang = opts.translation_lang
+    opts.audio_lang = opts.translation_lang
+else
+    process_lang_opt("autosub_lang", "slang")
+    process_lang_opt("audio_lang", "alang")
+end
 
 
 mp.add_hook("on_load", 9, function()
@@ -388,6 +443,7 @@ mp.add_hook("on_load", 9, function()
         ytdl.requested_subtitles = {}
         ytdl.automatic_captions = {}
         ytdl.id = youtube_id
+        ytdl._type = "video"
         ytdl.extractor = "youtube"
         if url_params:match("[?&]t=%d+") then
             ytdl.start_time = tonumber(url_params:match("[?&]t=(%d+)"))
@@ -441,6 +497,47 @@ mp.add_hook("on_load", 9, function()
             end
         end
         msg.verbose(string.format("Script running time: %.3f seconds", mp.get_time()-start_time))
+    else
+        local playlist_id = url_params:match("[?&]list=([%w%-_]+)")
+        local channel_id, rest = url_params:match("^channel/([%w%-_]+)(.*)")
+        local channel_handle = url_params:match("^@.*") or url_params:match("^user/(.*)") or url_params:match("^c/(.*)")
+        local channel_tab = (string.match(channel_handle or rest or "", "^[^/?]*(/%w+)") or ""):gsub("/featured", "")
+        
+        local ok
+        local ytdl = {}
+        ytdl.entries = {}
+        ytdl._type = "playlist"
+        ytdl.extractor = "youtube:tab"
+        
+        if playlist_id and #playlist_id >= 10 then
+            ok = parse_playlist(ytdl, playlist_id, "normal")
+        elseif channel_id or channel_handle then
+            local tab_name
+            for pl_name, pl_type in pairs(playlist_types) do
+                if pl_type.path == channel_tab then tab_name = pl_name end
+            end
+            if channel_tab ~= "" and not tab_name then
+                msg.warn("Unsupported channel tab: " .. channel_tab)
+                return
+            end
+            
+            if tab_name and channel_id then
+                ok = parse_playlist(ytdl, channel_id, tab_name)
+            elseif channel_id or (channel_handle and channel_tab == "") then
+                ok = parse_channel(ytdl, channel_id or url)
+            elseif channel_handle and channel_tab ~= "" then
+                -- не получится сформировать ссылку на автоплейлист без channel_id, поэтому сначала придётся разрешить ссылку на канал
+                local success = parse_channel(ytdl, url, 1)
+                if success and ytdl.id then
+                    ok = parse_playlist(ytdl, ytdl.id, tab_name)
+                end
+            end
+        end
+        
+        if ok then
+            local res = { status = 0, stdout = utils.format_json(ytdl), stderr = "" }
+            mp.set_property_native("user-data/mpv/ytdl/json-subprocess-result", res)
+        end
     end
 end)
 
@@ -467,7 +564,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         table.insert(args, h)
     end
     table.insert(args, "--data")
-    table.insert(args, get_innertube_request(extractors[extractor_name], get_config and nil or youtube_id))
+    table.insert(args, get_innertube_request(extractors[extractor_name], get_config and nil or {videoId = youtube_id}))
     table.insert(args, "--compressed") -- если используемый curl не поддерживает сжатие, оно просто не будет запрашиваться
     
     local ytdl_opts = mp.get_property_native("ytdl-raw-options") or {}
@@ -480,7 +577,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         ytdl.proxy = proxy -- ytdl_hook выставит этот прокси для скачивания медиапотоков плеером (хотя yt-dlp почему-то не возвращает это поле в своём json)
     end
     
-    table.insert(args, get_innertube_api_route(extractors[extractor_name], get_config))
+    table.insert(args, get_innertube_api_route(extractors[extractor_name], get_config and "/config" or nil))
     
     msg.verbose(string.format("Downloading %s %s%s", extractor_name, get_config and "config" or "player response", async_cb and " (async)" or ""))
     if async_cb then
@@ -687,7 +784,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             local vtrack_considered = q > 1
             
             -- для аудиопотоков
-            if opts.translation_lang ~= "" and form.language and form.language:find("^"..opts.translation_lang) then -- название языка уже прошло обработку
+            if opts.audio_lang ~= "" and form.language and form.language:gsub("%-.*", "") == opts.audio_lang then
                 q = q + 1000
             end
             if not vtrack_considered then
@@ -741,7 +838,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                     form.qualityLabel = form.qualityLabel and (form.qualityLabel .. " Premium") or "Premium"
                 end
                 if form.audioTrack then
-                    if form.language and (not form.language:find("^"..opts.translation_lang) or opts.translation_lang == "") then
+                    if form.language and (form.language:gsub("%-.*", "") ~= opts.audio_lang or opts.audio_lang == "") then
                         dubs = true        -- если оригинал уже на желаемом языке, незачем получать дубляжи
                     end
                     if form.audioTrack.displayName then
@@ -795,8 +892,8 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             end
         end
         
-        local duration = response.videoDetails and response.videoDetails.lengthSeconds and tonumber(response.videoDetails.lengthSeconds)
-        if duration and response.storyboards and response.storyboards.playerStoryboardSpecRenderer and response.storyboards.playerStoryboardSpecRenderer.spec then
+        local duration = tonumber(try_get(response, "videoDetails.lengthSeconds") or "")
+        if duration and try_get(response, "storyboards.playerStoryboardSpecRenderer.spec") then
             add_storyboard_formats(ytdl, response.storyboards.playerStoryboardSpecRenderer.spec, duration)
         end
         
@@ -820,7 +917,7 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                 }
                 ytdl.automatic_captions[lang_code] = { auto_subs }
                 
-                if lang_code == opts.translation_lang and not ytdl.requested_subtitles[opts.translation_lang] then
+                if opts.autosub_lang ~= "" and lang_code:gsub("%-.*", "") == opts.autosub_lang and not ytdl.requested_subtitles[lang_code] then
                     ytdl.requested_subtitles[poison_lang_code(lang_code) .. "-autotr"] = auto_subs
                 end
             end
@@ -856,21 +953,26 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             if orig_lang and ytdl.subtitles[orig_lang] then
                 src_lang = orig_lang
                 src_fmt = ytdl.subtitles[orig_lang][1]
-            elseif not src_lang and next(ytdl.automatic_captions) and next(ytdl.automatic_captions) ~= opts.translation_lang
+            elseif not src_lang and next(ytdl.automatic_captions) and not ytdl.automatic_captions[opts.autosub_lang]
                     and ytdl.automatic_captions[next(ytdl.automatic_captions)][1].translatable then
-                src_lang = next(ytdl.automatic_captions)
+                src_lang = ytdl.automatic_captions["en"] and "en" or next(ytdl.automatic_captions)
                 src_fmt = ytdl.automatic_captions[src_lang][1]
             end
 
-            if not opts.auto_subs_action:find("skip") and src_lang and opts.translation_lang ~= "" then
+            if not opts.auto_subs_action:find("skip") and src_lang and opts.autosub_lang ~= "" then
                 -- названия языков для перевода могут быть недоступны (например, если в языковой паре нет английского), поэтому полагаться на их наличие нельзя
                 for _, tlang in ipairs(response.captions.playerCaptionsTracklistRenderer.translationLanguages or {}) do
                     if tlang.languageCode and src_lang ~= tlang.languageCode and not ytdl.subtitles[tlang.languageCode] then
                         add_autotranslated_subs(tlang.languageCode, try_get(tlang, "languageName.runs[1].text"))
                     end
                 end
-                if not ytdl.automatic_captions[opts.translation_lang] and not ytdl.requested_subtitles[opts.translation_lang] then
-                    add_autotranslated_subs(opts.translation_lang)
+                
+                local autosubs_name_available
+                for subs in pairs(ytdl.requested_subtitles) do
+                    if subs:gsub(ZWSP, ""):gsub("%-.*", "") == opts.autosub_lang then autosubs_name_available = true end
+                end
+                if not autosubs_name_available then
+                    add_autotranslated_subs(opts.autosub_lang)
                 end
             end
         end
@@ -1081,6 +1183,13 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
             msg.warn(string.format("Attempt failed after %.3f s, %s", mp.get_time() - start, err))
             msg.info("Trying " .. opts.yt_kids_extractor .. " extractor fallback")
             return parse_yt(ytdl, youtube_id, opts.yt_kids_extractor, checks)
+        elseif status == "UNPLAYABLE" and opts.proxy_when_unsure and #ytdl.formats == 0 and opts.geoblock_proxy ~= "" and proxy ~= opts.geoblock_proxy then
+            -- изредка для роликов с региональными ограничениями Ютуб не сообщает об этом, а лишь возвращает всё то же расплывчатое "Видео недоступно."
+            -- например (для GeoIP BY, RU) https://youtu.be/8JMMjCyyznI
+            msg.warn(string.format("Attempt failed after %.3f s, %s", mp.get_time() - start, err))
+            msg.info("Trying to open with geoblock proxy")
+            ytdl.proxy = opts.geoblock_proxy
+            return parse_yt(ytdl, youtube_id, extractor_name, checks)
         elseif status == "LOGIN_REQUIRED" and (vdata_missing or not (extractors[extractor_name].visitor_id_required or force_vdata)) and not vdata_is_stale() then
             -- не получилось извлечь visitorData из конфига, получена ожидаемая ошибка, зато удалось извлечь прямо из текущего ответа,
             -- а значит можно попробовать повторить парсинг уже с требуемым заголовком
@@ -1226,16 +1335,6 @@ function parse_microformat(ytdl, microformat)
 end
 
 function chapters_from_description(text, video_dur)
-    local function parse_time(timetext)
-        if timetext and timetext:match("^%d+:%d%d:%d%d") then
-            local h, m, s = timetext:match("^(%d+):(%d%d):(%d%d)")
-            return h * 3600 + m * 60 + s
-        elseif timetext and timetext:match("^%d+:%d%d") then
-            local m, s = timetext:match("^(%d+):(%d%d)")
-            return m * 60 + s
-        end
-    end
-
     local chaplist = {}
     local last_timestamp = -1 -- таймкоды должны идти строго по возрастанию
     local video_duration = video_dur or 10^9
@@ -1359,8 +1458,8 @@ function populate_with_web_metadata(success, res)
     
     local response = utils.parse_json(res.stdout)
     if response and response.playabilityStatus then
-        local duration = response.videoDetails and response.videoDetails.lengthSeconds and tonumber(response.videoDetails.lengthSeconds)
-        if duration and response.storyboards and response.storyboards.playerStoryboardSpecRenderer and response.storyboards.playerStoryboardSpecRenderer.spec then
+        local duration = tonumber(try_get(response, "videoDetails.lengthSeconds") or "")
+        if duration and try_get(response, "storyboards.playerStoryboardSpecRenderer.spec") then
             add_storyboard_formats(ytdl, response.storyboards.playerStoryboardSpecRenderer.spec, duration)
         end
         if response.microformat and response.microformat.playerMicroformatRenderer then
@@ -1375,4 +1474,298 @@ function populate_with_web_metadata(success, res)
     end
     ytdl_result.stdout = utils.format_json(ytdl)
     mp.set_property_native("user-data/mpv/ytdl/json-subprocess-result", ytdl_result)
+end
+
+
+function parse_playlist(ytdl, req_id, pl_type)
+    local start = mp.get_time()
+    local continuation_token
+    local seen_entries = 0
+    
+    repeat
+        local args = { opts.curl_path, "--silent", "--show-error", "--request", "POST", "--connect-timeout", "10", "--max-time", "30", "--compressed" }
+        local api_headers = get_innertube_api_headers(extractors[playlist_extractor])
+        for _, h in ipairs(api_headers) do
+            table.insert(args, "--header")
+            table.insert(args, h)
+        end
+        local pl_id = playlist_types[pl_type].prefix .. req_id:sub(1 + playlist_types[pl_type].lsub)
+        local req_data = {
+            browseId = not continuation_token and playlist_types[pl_type].api_route == "browse" and ("VL" .. pl_id) or nil,
+            playlistId = not continuation_token and playlist_types[pl_type].api_route == "next_pl" and pl_id or nil,
+            continuation = continuation_token,
+            params = "wgYCCAA=" -- для возвращения в плейлисте также и скрытых видео (подобно yt-dlp)
+        }
+        table.insert(args, "--data")
+        table.insert(args, get_innertube_request(extractors[playlist_extractor], req_data))
+        
+        local proxy = (mp.get_property_native("ytdl-raw-options") or {}).proxy or mp.get_property("http-proxy")
+        if proxy and proxy ~= "" then
+            table.insert(args, "--proxy")
+            table.insert(args, proxy)
+        end
+        
+        table.insert(args, get_innertube_api_route(playlist_types[pl_type]))
+        
+        if not continuation_token then
+            msg.verbose("Downloading " .. pl_type .. " playlist initial response")
+        else
+            msg.verbose(string.format("Downloading %s playlist continuation (%d of %s videos done, %d received)",
+                    pl_type, seen_entries, ytdl.playlist_count and tostring(ytdl.playlist_count) or "?", #ytdl.entries))
+        end
+        
+        local res = {}
+        local max_retries = 3
+        for att = 0, max_retries do 
+            -- если во время парсинга плейлиста случится ошибка сети, весь предыдущий прогресс потеряется,
+            -- поэтому пробуем повторить попытку прямо в самом скрипте (по умолчанию curl возвращает статус-код 0 даже при ошибках 4xx/5xx от сервера,
+            -- значит ненулевой код это почти наверняка именно ошибка сети, которая может пройти при повторной попытке)
+            if att > 0 and res.status then
+                msg.warn(string.format("Playlist downloading failed, curl status: %d, retrying (%d/%d)", res.status, att, max_retries))
+            end
+            res = mp.command_native({name="subprocess", capture_stdout=true, args=args})    --mp.set_property("clipboard/text", res.stdout)   
+            if res.error_string == "init" or res.killed_by_us then
+                return
+            end
+            if res.status == 0 then break end
+        end
+        
+        continuation_token = nil
+        msg.debug("Playlist response length: " .. #res.stdout)
+        
+        local json = utils.parse_json(res.stdout)
+        local videos = try_get(json, "contents.twoColumnBrowseResultsRenderer.tabs[1].tabRenderer.content.sectionListRenderer.contents[1].itemSectionRenderer.contents")
+                or try_get(json, "onResponseReceivedActions[1].appendContinuationItemsAction.continuationItems")
+                or try_get(json, "contents.twoColumnWatchNextResults.playlist.playlist.contents")
+                or try_get(json, "continuationContents.playlistPanelContinuation.contents")
+        if videos and #videos > 0 then
+            local function parse_metadata_rows(dest, meta_rows, is_header)
+                if not meta_rows then return end
+                local text_data = try_get(meta_rows[1], "metadataParts[1].text") or try_get(meta_rows[1], "metadataParts[1].avatarStack.avatarStackViewModel.text")
+                dest.uploader = try_get(text_data, "commandRuns[1].onTap") and text_data.content or nil
+                dest.channel_id = try_get(text_data, "commandRuns[1].onTap.innertubeCommand.browseEndpoint.browseId")
+                if not is_header then
+                    dest.view_count_text = try_get(meta_rows[2], "metadataParts[1].text.content") -- содержит лишь примерное число текстом, зависящим от языка
+                    dest.relative_time_text = try_get(meta_rows[2], "metadataParts[2].text.content")
+                else
+                    dest.playlist_count = dest.playlist_count or parse_num(try_get(meta_rows[2], "metadataParts[2].text.content"))
+                    dest.view_count = dest.view_count or parse_num(try_get(meta_rows[2], "metadataParts[3].text.content"))
+                end
+            end
+            
+            local video_entries = try_get(videos[1], "playlistVideoListRenderer.contents") or videos
+            for _, entry in ipairs(video_entries) do
+                local data = { _type = "url" }
+                if entry.lockupViewModel and entry.lockupViewModel.contentId and #entry.lockupViewModel.contentId == 11 then
+                    data.id = entry.lockupViewModel.contentId
+                    data.title = try_get(entry, "lockupViewModel.metadata.lockupMetadataViewModel.title.content")
+                    data.duration_string = try_get(entry, "lockupViewModel.contentImage.thumbnailViewModel.overlays[1]"
+                            .. ".thumbnailBottomOverlayViewModel.badges[1].thumbnailBadgeViewModel.text")
+                    local meta_rows = try_get(entry, "lockupViewModel.metadata.lockupMetadataViewModel.metadata.contentMetadataViewModel.metadataRows")
+                    parse_metadata_rows(data, meta_rows)
+                elseif entry.playlistVideoRenderer and entry.playlistVideoRenderer.videoId then
+                    data.id = entry.playlistVideoRenderer.videoId
+                    data.title = try_get(entry, "playlistVideoRenderer.title.runs[1].text")
+                    data.duration_string = try_get(entry, "playlistVideoRenderer.lengthText.simpleText") 
+                            or try_get(entry, "playlistVideoRenderer.thumbnailOverlays[1].thumbnailOverlayTimeStatusRenderer.text.simpleText")
+                    data.uploader = try_get(entry, "playlistVideoRenderer.shortBylineText.runs[1].text")
+                    data.channel_id = try_get(entry, "playlistVideoRenderer.shortBylineText.runs[1].navigationEndpoint.browseEndpoint.browseId")
+                elseif entry.playlistPanelVideoRenderer and entry.playlistPanelVideoRenderer.videoId then
+                    data.id = entry.playlistPanelVideoRenderer.videoId
+                    data.title = try_get(entry, "playlistPanelVideoRenderer.title.simpleText")
+                    data.duration_string = try_get(entry, "playlistPanelVideoRenderer.lengthText.simpleText")
+                    data.uploader = try_get(entry, "playlistPanelVideoRenderer.shortBylineText.runs[1].text")
+                    data.channel_id = try_get(entry, "playlistPanelVideoRenderer.shortBylineText.runs[1].navigationEndpoint.browseEndpoint.browseId")
+                elseif entry.continuationItemViewModel then
+                    continuation_token = try_get(entry.continuationItemViewModel, "continuationCommand.innertubeCommand.continuationCommand.token")
+                elseif entry.continuationItemRenderer then
+                    local commands = try_get(entry.continuationItemRenderer, "continuationEndpoint.commandExecutorCommand.commands")
+                    for _, cmd in ipairs(commands or {}) do
+                        continuation_token = continuation_token or try_get(cmd, "continuationCommand.token")
+                    end
+                end
+                
+                if data.id and (data.title or data.duration_string or data.uploader or data.channel_id) then
+                    data.url = "https://www.youtube.com/watch?v=" .. data.id
+                    data.duration = parse_time(data.duration_string)
+                    data.thumbnails = {{ -- Ютуб обычно даёт ссылки на превью в низком разрешении (до 336x188), почти как у данного превью, доступного всегда
+                        url = "https://i.ytimg.com/vi/" .. data.id .. "/mqdefault.jpg",
+                        width = 320,
+                        height = 180
+                    }}
+                    if data.channel_id then
+                        data.channel_url = "https://www.youtube.com/channel/" .. data.channel_id
+                    end
+                    table.insert(ytdl.entries, data)
+                elseif data.id then 
+                    -- если для видео недоступно вообще никаких метаданных (даже названия), скорее всего, оно удалено или полностью недоступно
+                    msg.debug("Skipping potentially inaccessible entry without any metadata: " .. utils.format_json(entry))
+                end
+                if data.id then seen_entries = seen_entries + 1 end
+            end
+            continuation_token = continuation_token or try_get(json, 
+                    "contents.twoColumnWatchNextResults.playlist.playlist.continuations[1].nextContinuationData.continuation")
+                    or try_get(json, "continuationContents.playlistPanelContinuation.continuations[1].nextContinuationData.continuation")
+            
+            if not ytdl.title then
+                local header = try_get(json, "header.playlistHeaderRenderer") or try_get(json, "header.pageHeaderRenderer") or {}
+                local next_pl_meta = try_get(json, "contents.twoColumnWatchNextResults.playlist.playlist") or {}
+                ytdl.id = pl_id
+                ytdl.title = try_get(header, "title.simpleText") or header.pageTitle or try_get(json, "microformat.microformatDataRenderer.title") or next_pl_meta.title
+                ytdl.description = try_get(json, "metadata.playlistMetadataRenderer.description")
+                ytdl.uploader = try_get(header, "ownerText.runs[1].text") or try_get(next_pl_meta, "ownerName.simpleText")
+                ytdl.channel_id = try_get(header, "ownerText.runs[1].navigationEndpoint.browseEndpoint.browseId")
+                        or try_get(next_pl_meta, "shortBylineText.runs[1].navigationEndpoint.browseEndpoint.browseId")
+                ytdl.playlist_count = parse_num(try_get(header, "numVideosText.runs[1].text")) or parse_num(try_get(header, "stats[1].runs[1].text"))
+                        or parse_num(try_get(next_pl_meta, "totalVideosText.runs[1].text"))
+                ytdl.view_count = parse_num(try_get(header, "viewCountText.simpleText")) or parse_num(try_get(header, "stats[2].simpleText"))
+                ytdl.webpage_url = try_get(json, "microformat.microformatDataRenderer.urlCanonical")
+                parse_metadata_rows(ytdl, try_get(header, "content.pageHeaderViewModel.metadata.contentMetadataViewModel.metadataRows"), true)
+                ytdl.channel_url = ytdl.channel_id and ("https://www.youtube.com/channel/" .. ytdl.channel_id) or nil
+                
+                if #ytdl.entries == 0 and #videos == 1 and try_get(videos[1], "messageRenderer.text.runs[1].text") then
+                    msg.info(videos[1].messageRenderer.text.runs[1].text) -- сообщение о пустом плейлисте
+                    return true
+                elseif #ytdl.entries == 0 then -- в этом случае, если yt-dlp доступен, плейлист будет пробоваться открыться им (в скрипте ytdl_hook)
+                    if seen_entries == 0 then
+                        report_error("Unable to recognize playlist format")
+                    else -- возможно, Ютуб поменял структуру json плейлиста, из-за чего сломался парсер
+                        report_error("Failed to extract any metadata for all playlist entries")
+                    end
+                    msg.debug("Playlist json: " .. (utils.format_json(video_entries) or "(nil)"))
+                elseif continuation_token then 
+                    msg.info(string.format("Parsing playlist '%s'... (%s videos)", ytdl.title or "?", ytdl.playlist_count or "?"))
+                end
+            end
+            if ytdl.title and ytdl.playlist_count and #ytdl.entries > 0 and opts.show_parsing_progress then
+                mp.set_property("file-local-options/force-media-title", string.format("Parsing %s \"%s\"... (%d%%)",
+                        playlist_types[pl_type].path and "tab" or "playlist", ytdl.title, seen_entries / ytdl.playlist_count * 100))
+            end
+        elseif json and (try_get(json, "alerts[1].alertRenderer.type") == "ERROR" or try_get(json, "error.message")) then
+            local reason = try_get(json, "alerts[1].alertRenderer.text.runs[1].text") or try_get(json, "error.message")
+            local err = reason and string.format("Youtube said: %s", reason) or "error alert received from Youtube"
+            report_error("Playlist parsing failed, " .. err)
+            return
+        elseif res.status == 0 then
+            report_error(string.format("Playlist parsing failed, %s, response length: %d",
+                    json and "unable to recognize json" or "json string unparsable", #res.stdout))
+            msg.debug("Innertube response: " .. (#res.stdout > 0 and res.stdout or "(nil)"))
+            return
+        else
+            report_error("Playlist parsing failed, curl finished with error code " .. tostring(res.status))
+            return
+        end
+    until not continuation_token
+    
+    if #ytdl.entries > 0 then
+        msg.info(string.format("Playlist parsing succeeded (took %.3f s, %d%s entries received)",
+                mp.get_time() - start, #ytdl.entries, ytdl.playlist_count and (" of " .. ytdl.playlist_count) or ""))
+        return true
+    end
+end
+
+function parse_channel(ytdl, channel_data, resolve_iter)
+    local start = mp.get_time()
+    if channel_data:find("^https?://") then
+        ytdl.webpage_url = channel_data
+    else
+        ytdl.id = channel_data
+    end
+    resolve_iter = resolve_iter or 0
+    
+    if not ytdl.id and resolve_iter == 0 then
+        local success = parse_channel(ytdl, channel_data, 1) and ytdl.id
+        if not success then
+            return
+        end
+    end
+    
+    if ytdl.id and not opts.split_channel_by_tabs then
+        msg.debug("Redirecting to channel's uploads playlist")
+        return parse_playlist(ytdl, ytdl.id, "uploads")
+    end
+    
+    local args = { opts.curl_path, "--silent", "--show-error", "--request", "POST", "--connect-timeout", "10", "--max-time", "30", "--compressed" }
+    local api_headers = get_innertube_api_headers(extractors[playlist_extractor])
+    for _, h in ipairs(api_headers) do
+        table.insert(args, "--header")
+        table.insert(args, h)
+    end
+    local req_data = {
+        browseId = resolve_iter==0 and (ytdl.id or channel_data) or nil,
+        url = resolve_iter>0 and channel_data:gsub("([^%w%p])", function(c) return string.format("%%%02X", string.byte(c)) end) or nil
+    }
+    table.insert(args, "--data")
+    table.insert(args, get_innertube_request(extractors[playlist_extractor], req_data))
+
+    local proxy = (mp.get_property_native("ytdl-raw-options") or {}).proxy or mp.get_property("http-proxy")
+    if proxy and proxy ~= "" then
+        table.insert(args, "--proxy")
+        table.insert(args, proxy)
+    end
+    
+    table.insert(args, get_innertube_api_route(nil, resolve_iter>0 and "/navigation/resolve_url" or "/browse"))
+    
+    msg.verbose(resolve_iter>0 and ("Resolving channel url " .. channel_data) or "Downloading channel home tab response")
+    local res = mp.command_native({name="subprocess", capture_stdout=true, args=args})    --mp.set_property("clipboard/text", res.stdout)   
+    if res.error_string == "init" or res.killed_by_us then
+        return
+    end
+    msg.debug("Channel response length: " .. #res.stdout)
+        
+    local json = utils.parse_json(res.stdout)
+    local err_type = resolve_iter>0 and "Failed to resolve channel handle" or "Channel parsing failed"
+    if resolve_iter > 0 and try_get(json, "endpoint.browseEndpoint.browseId") then
+        ytdl.id = json.endpoint.browseEndpoint.browseId
+        msg.verbose("Resolving succeeded, got channel_id")
+        return true
+    elseif resolve_iter > 0 and try_get(json, "endpoint.urlEndpoint.url") then
+        if resolve_iter < 3 then -- иногда Ютуб не сразу выдаёт id канала, а даёт другую ссылку, которую также необходимо разрешить
+            ytdl.webpage_url = json.endpoint.urlEndpoint.url
+            msg.verbose("Got url redirect during resolving: " .. ytdl.webpage_url)
+            return parse_channel(ytdl, ytdl.webpage_url, resolve_iter + 1)
+        else
+            report_error(err_type .. ": too many redirects")
+        end
+    elseif resolve_iter == 0 and try_get(json, "contents.twoColumnBrowseResultsRenderer.tabs") then
+        ytdl.title = try_get(json, "metadata.channelMetadataRenderer.title") or try_get(json, "header.pageHeaderRenderer.pageTitle")
+        ytdl.description = try_get(json, "metadata.channelMetadataRenderer.description")
+        ytdl.uploader = ytdl.title
+        ytdl.channel_id = try_get(json, "metadata.channelMetadataRenderer.externalId") or ytdl.id
+        ytdl.channel_url = try_get(json, "metadata.channelMetadataRenderer.channelUrl")
+        
+        local seen_tabs = 0
+        for _, tab in ipairs(json.contents.twoColumnBrowseResultsRenderer.tabs) do
+            if try_get(tab, "tabRenderer.endpoint.commandMetadata.webCommandMetadata.url") then
+                seen_tabs = seen_tabs + 1
+                -- интересуют только вкладки с видео различных типов, представленных на канале, для их дальшейшего отдельного парсинга
+                for pl_name, pl_type in pairs(playlist_types) do
+                    if pl_type.path and tab.tabRenderer.endpoint.commandMetadata.webCommandMetadata.url:match(pl_type.path.."$") then
+                        local tab_url = "https://www.youtube.com/channel/" .. ytdl.id .. pl_type.path
+                        table.insert(ytdl.entries, {
+                            url = tab_url,
+                            webpage_url = tab_url,
+                            title = (ytdl.uploader and (ytdl.uploader.." - ") or "") .. (try_get(tab, "tabRenderer.title") or pl_name),
+                            _type = "playlist",
+                            uploader = ytdl.uploader,
+                            channel_id = ytdl.channel_id,
+                            channel_url = ytdl.channel_url
+                        })
+                        break
+                    end
+                end
+            end
+        end
+        if seen_tabs > 0 or #json.contents.twoColumnBrowseResultsRenderer.tabs == 1 then
+            msg.info(#ytdl.entries == 0 and "Channel doesn't have public videos"
+                    or string.format("Channel data parsing succeeded (took %.3f s, %d tabs available)", mp.get_time() - start, #ytdl.entries))
+            return true
+        end
+    elseif res.status == 0 then
+        report_error(string.format("%s: %s, response length: %d", err_type,
+                json and "unable to recognize json" or "json string unparsable", #res.stdout))
+        msg.debug("Innertube response: " .. (#res.stdout > 0 and res.stdout or "(nil)"))
+    else
+        report_error(err_type .. ", curl finished with error code " .. tostring(res.status))
+    end
 end
