@@ -1,3 +1,9 @@
+
+-- раскрывать плейлист, к которому относится открываемый Ютуб-ролик
+-- (больше это не требуется, поскольку Ютуб-парсер поддерживает это нативно, так же как и ytdl_hook с yes-playlist=
+--  к тому же этот трюк работал лишь при открытии ссылки через Ctrl+V, а в остальных случаях (например, drag&drop ссылки) - нет)
+expand_yt_playlists = false
+
 local subprocess = {
    name = "subprocess",
    args = { 'powershell', '-NoProfile', '-Command', [[& {
@@ -62,19 +68,12 @@ function openURL(append)
       mp.osd_message("Clipboard empty")
       return
    end
-   
-   --immediately resume playback after loading URL
-   -- if mp.get_property_bool("core-idle") then
-      -- if not mp.get_property_bool("idle-active") then
-         -- mp.command("keypress space")
-      -- end
-   -- end
 
    --try opening url
    --will fail if url is not valid
    mp.osd_message(prefix .. " URL:\n"..url)
    mp.command("script-message-to SimpleHistory list-close")
-   if command == "replace" and url:match("youtube%.com") and url:match("watch%?v=([%w_-]+)") and url:match("list=([%w_-]+)") then
+   if expand_yt_playlists and command == "replace" and url:match("youtube%.com") and url:match("watch%?v=([%w_-]+)") and url:match("list=([%w_-]+)") then
       local list = url:match("list=([%w_-]+)")
       yt_id = url:match("watch%?v=([%w_-]+)")
       mp.osd_message(prefix .. " Youtube playlist:\n" .. url)
@@ -90,7 +89,7 @@ function change_pl_pos(_, plc)
     local pos = mp.get_property_number("playlist-pos")
     for i = 0, plc-1 do
         local link = mp.get_property("playlist/" .. i .. "/filename")
-        if yt_id and link:find("v=" .. yt_id) and pos ~= i then
+        if yt_id and link:find("v=" .. yt_id, 1, true) and pos ~= i then
             mp.commandv("playlist-play-index", i)
             break
         end

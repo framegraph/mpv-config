@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v1.0
+-- Ютуб-парсер для MPV плеера v1.1
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -449,6 +449,39 @@ mp.add_hook("on_load", 9, function()
             ytdl.start_time = tonumber(url_params:match("[?&]t=(%d+)"))
         end
         local checked_extractors = {[""] = true} -- если доп. экстрактор (например, для премиум потока) не задан, он всегда будет считаться проверенным
+        
+        local playlist_id = url_params:match("[?&]list=([%w%-_]+)")
+        if playlist_id and #playlist_id >= 10 then -- если с открываемым роликом связан плейлист, пробуем также добавить остальные видео оттуда
+            local orig_forced_title = mp.get_property("force-media-title") or ""
+            local pl_ytdl = {}
+            pl_ytdl.entries = {}
+            local success = parse_playlist(pl_ytdl, playlist_id, "normal", true) 
+            if success then
+                local index
+                for i, entry in ipairs(pl_ytdl.entries) do
+                    if entry.id == youtube_id and not index then 
+                        msg.verbose("Found requested video in associated playlist at index " .. i)
+                        index = i
+                    end
+                end
+                
+                if index then
+                    local pl_entries = {}
+                    for _, entry in ipairs(pl_ytdl.entries) do
+                        table.insert(pl_entries, string.format("#EXTINF:%d,%s\n%s", 
+                                entry.duration or 0, (entry.title or entry.url):gsub("[\r\n]+", " "), entry.url))
+                    end
+                    mp.set_property("stream-open-filename", "memory://#EXTM3U\n" .. table.concat(pl_entries, "\n"))
+                    mp.set_property_number("file-local-options/playlist-start", index-1)
+                    return
+                else
+                    msg.warn("Unable to find video in its associated playlist - discarding this playlist")
+                end
+            elseif success == false then -- ролик закрыт во время парсинга плейлиста
+                return
+            end
+            if opts.show_parsing_progress then mp.set_property("file-local-options/force-media-title", orig_forced_title) end
+        end
         
         initial_path = url
         if opts.parse_web_player_async then
@@ -1477,10 +1510,19 @@ function populate_with_web_metadata(success, res)
 end
 
 
-function parse_playlist(ytdl, req_id, pl_type)
+function parse_playlist(ytdl, req_id, pl_type, noncritical)
+    local function pl_report_error(text)
+        if not noncritical then
+            report_error(text)
+        else -- парсится плейлист, связанный с открываемым роликом, поэтому ошибки парсинга некритичны
+            msg.warn(text)
+        end
+    end
+    
     local start = mp.get_time()
     local continuation_token
     local seen_entries = 0
+    local title_override = mp.get_property("force-media-title") or ""
     
     repeat
         local args = { opts.curl_path, "--silent", "--show-error", "--request", "POST", "--connect-timeout", "10", "--max-time", "30", "--compressed" }
@@ -1525,7 +1567,7 @@ function parse_playlist(ytdl, req_id, pl_type)
             end
             res = mp.command_native({name="subprocess", capture_stdout=true, args=args})    --mp.set_property("clipboard/text", res.stdout)   
             if res.error_string == "init" or res.killed_by_us then
-                return
+                return false
             end
             if res.status == 0 then break end
         end
@@ -1628,31 +1670,31 @@ function parse_playlist(ytdl, req_id, pl_type)
                     return true
                 elseif #ytdl.entries == 0 then -- в этом случае, если yt-dlp доступен, плейлист будет пробоваться открыться им (в скрипте ytdl_hook)
                     if seen_entries == 0 then
-                        report_error("Unable to recognize playlist format")
+                        pl_report_error("Unable to recognize playlist format")
                     else -- возможно, Ютуб поменял структуру json плейлиста, из-за чего сломался парсер
-                        report_error("Failed to extract any metadata for all playlist entries")
+                        pl_report_error("Failed to extract any metadata for all playlist entries")
                     end
                     msg.debug("Playlist json: " .. (utils.format_json(video_entries) or "(nil)"))
                 elseif continuation_token then 
                     msg.info(string.format("Parsing playlist '%s'... (%s videos)", ytdl.title or "?", ytdl.playlist_count or "?"))
                 end
             end
-            if ytdl.title and ytdl.playlist_count and #ytdl.entries > 0 and opts.show_parsing_progress then
+            if ytdl.title and ytdl.playlist_count and #ytdl.entries > 0 and opts.show_parsing_progress and title_override == "" then
                 mp.set_property("file-local-options/force-media-title", string.format("Parsing %s \"%s\"... (%d%%)",
                         playlist_types[pl_type].path and "tab" or "playlist", ytdl.title, seen_entries / ytdl.playlist_count * 100))
             end
         elseif json and (try_get(json, "alerts[1].alertRenderer.type") == "ERROR" or try_get(json, "error.message")) then
             local reason = try_get(json, "alerts[1].alertRenderer.text.runs[1].text") or try_get(json, "error.message")
             local err = reason and string.format("Youtube said: %s", reason) or "error alert received from Youtube"
-            report_error("Playlist parsing failed, " .. err)
+            pl_report_error("Playlist parsing failed, " .. err)
             return
         elseif res.status == 0 then
-            report_error(string.format("Playlist parsing failed, %s, response length: %d",
+            pl_report_error(string.format("Playlist parsing failed, %s, response length: %d",
                     json and "unable to recognize json" or "json string unparsable", #res.stdout))
             msg.debug("Innertube response: " .. (#res.stdout > 0 and res.stdout or "(nil)"))
             return
         else
-            report_error("Playlist parsing failed, curl finished with error code " .. tostring(res.status))
+            pl_report_error("Playlist parsing failed, curl finished with error code " .. tostring(res.status))
             return
         end
     until not continuation_token
