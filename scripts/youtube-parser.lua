@@ -1,4 +1,4 @@
--- Ютуб-парсер для MPV плеера v1.1
+-- Ютуб-парсер для MPV плеера v1.2
 -- скрипт из сборки https://github.com/framegraph/mpv-config
 -- для работы также требует кастомный ytdl_hook.lua из сборки
 
@@ -26,7 +26,7 @@ local opts = {
     audio_lang = "auto",
     auto_subs_action = "deselect", -- skip | skip-translated | deselect | none
     premium_extractor = "",
-    yt_kids_extractor = "ios_testsuite",
+    yt_kids_extractor = "ios_reel",
     dubbed_tracks_extractor = "",
     livestream_extractor = "",
     geoblock_proxy = "",
@@ -96,7 +96,6 @@ local extractors = {
         visitor_id_required = true,
         api_route = "player",
     },
-    -- теперь стал всегда требовать PO Token (кроме качества 360p и HLS трансляций, которые воспроизводит стабильно)
     android_reel = { -- также поддерживает извлечение дополнительных метаданных (дата публикации, число лайков, комментариев...)
         client = {
             clientName = "ANDROID",
@@ -107,13 +106,12 @@ local extractors = {
         client_id = 3,
         yt_kids_available = true,
         premium_available = false,
-        dubbed_tracks_available = false,
+        dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости" и многоканальный (surround) звук
         visitor_id_required = false,
-        adaptive_formats_unplayable = true,
         api_route = "reel",
+        player_params = "8AEB"
     },
-    -- в отличие от iOS даёт воспроизводимые DASH потоки и стабильно возвращает HLS, но они тоже открываются не всегда (возможен эксперимент с PO Token)
-    ios_reel = {
+    ios_reel = { -- в отличие от iOS даёт воспроизводимые DASH потоки и стабильно возвращает HLS манифест (и предоставляет доп. метаданные)
         client = {
             clientName = "IOS",
             clientVersion = "21.02.3",
@@ -129,9 +127,9 @@ local extractors = {
         dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости"
         visitor_id_required = false,
         api_route = "reel",
+        player_params = "8AEB"
     },
-    -- также перестал работать
-    android_vr_reel = { -- эквивалент android_vr, но с предоставлением доп. метаданных
+    android_vr_reel = { -- рабочий аналог android_vr с предоставлением доп. метаданных
         client = {
             clientName = "ANDROID_VR",
             clientVersion = "1.63.57",
@@ -143,8 +141,9 @@ local extractors = {
         dubbed_tracks_available = false,
         visitor_id_required = true,
         api_route = "reel",
+        player_params = "8AEB"
     },
-    visionos_reel = { -- visionos с предоставлением доп. метаданных (хотя, в отличие от него, начал иногда выдавать потоки с 403 Forbidden)
+    visionos_reel = { -- эквивалент visionos с предоставлением доп. метаданных
         client = {
             clientName = "VISIONOS",
             clientVersion = "1.01",
@@ -156,6 +155,7 @@ local extractors = {
         dubbed_tracks_available = true, -- включая дорожку "Постоянный уровень громкости"
         visitor_id_required = true,
         api_route = "reel",
+        player_params = "8AEB"
     },
     android_testsuite = { -- полностью рабочий Android экстрактор, пока не подверженный экспериментам
         -- также примечателен тем, что не накладывает троттлинг при загрузке DASH потоков запросами, не разбитыми на range request-ы <= 10 МБ
@@ -204,7 +204,7 @@ local extractors = {
         api_route = "player",
     },
 }
-local default_extractor = "ios_testsuite"
+local default_extractor = "ios_reel"
 local playlist_extractor = "web"
 
 local playlist_types = {
@@ -300,7 +300,7 @@ end
 local NBSP = "\194\160" -- неразрывный пробел
 local ZWSP = "\226\128\139" -- пробел нулевой ширины (Гитхабу не нравится, когда в коде невидимые символы записаны напрямую)
 function parse_num(str)
-    return str and tonumber((str:match("[%d%s"..NBSP.."%.,]+") or ""):gsub("[%s"..NBSP.."%.,]", ""), nil) or nil
+    return str and tonumber((str:match("%d[%d%s"..NBSP.."%.,]*") or ""):gsub("[^%d]+", ""), nil) or nil
 end
 function clean_str(str) -- удаление из строки невидимых спецсимволов (для сравнения локализованных метаданных с оригинальными)
     return str and str:gsub(ZWSP, ""):gsub("\226\128[\142\143\170-\174]", ""):gsub("\226\129\160", "") or nil
@@ -376,34 +376,36 @@ if opts.parse_hls_manifests == "false" then opts.parse_hls_manifests = "no" end
 if opts.skip_vp9 or opts.target_resolution < 1080 or opts.parse_hls_manifests == "no" then
     opts.premium_extractor = ""
 end
-if opts.extractor == "default" then
-    -- android_vr_reel использовался в сборке для получения максимального (для HLS) 4-часового таймшифта на прямых трансляциях
-    -- поскольку он перестал работать и пока нет других экстракторов с таким таймшифтом, убираю его до лучших времён
-    if opts.livestream_extractor:lower():find("android_vr") then
-        opts.livestream_extractor = ""
-    end
-    -- появился более стабильный ios_testsuite экстрактор, лучше подходящий на место дефолтного для открытия YT Kids роликов:
-    -- он возращает ровно те же потоки, что и ios_reel, разве что извлекает меньше метаданных
-    if opts.yt_kids_extractor == "ios_reel" then
-        opts.yt_kids_extractor = "ios_testsuite"
-    end
-end
+-- удалось пофиксить оба этих экстрактора, поэтому пока это больше не нужно
+-- if opts.extractor == "default" then
+    -- -- android_vr_reel использовался в сборке для получения максимального (для HLS) 4-часового таймшифта на прямых трансляциях
+    -- -- поскольку он перестал работать и пока нет других экстракторов с таким таймшифтом, убираю его до лучших времён
+    -- if opts.livestream_extractor:lower():find("android_vr") then
+        -- opts.livestream_extractor = ""
+    -- end
+    -- -- появился более стабильный ios_testsuite экстрактор, лучше подходящий на место дефолтного для открытия YT Kids роликов:
+    -- -- он возращает ровно те же потоки, что и ios_reel, разве что извлекает меньше метаданных
+    -- if opts.yt_kids_extractor == "ios_reel" then
+        -- opts.yt_kids_extractor = "ios_testsuite"
+    -- end
+-- end
 opts.extractor = opts.extractor:lower()
 opts.cache_path = mp.command_native({"expand-path", opts.cache_path})
 
-function sanity_check_extractor(opt, check, msg)
+function sanity_check_extractor(opt, check, message)
     opts[opt] = opts[opt]:lower()
     if not extractors[opts[opt]] and (opts[opt] ~= "") then
         msg.warn(string.format("Unknown extractor '%s'!", opts[opt]))
         opts[opt] = ""
     elseif check and opts[opt] ~= "" and not extractors[opts[opt]][check] then
-        msg.warn(string.format("'%s' %s, disabling", opts[opt], msg))
+        msg.warn(string.format("%s %s, disabling", opts[opt], message))
         opts[opt] = ""
     end
 end
 sanity_check_extractor("premium_extractor", "premium_available", "doesn't return premium format")
 sanity_check_extractor("dubbed_tracks_extractor", "dubbed_tracks_available", "doesn't return dubbed tracks")
 sanity_check_extractor("yt_kids_extractor", "yt_kids_available", "doesn't support YT Kids videos")
+sanity_check_extractor("livestream_extractor")
 
 function process_lang_opt(opt, lang_prop)
     opts[opt] = opts[opt]:lower()
@@ -624,11 +626,23 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
     elseif res.killed_by_us then -- видео закрыто вручную во время парсинга
         return false
     end
-    local json = utils.parse_json(res.stdout)
+    local json = parse_large_json(res.stdout)
     
     local extr_status = extract_visitor_data(json and (json.responseContext or try_get(json, "playerResponse.responseContext")) or nil)
     if get_config then
         return extr_status
+    end
+    
+    if not checks[opts.livestream_extractor] and json and try_get(json.playerResponse or json, "videoDetails.isLive") then
+        ytdl.is_live = true
+        msg.info("Trying to get " .. opts.livestream_extractor .. " livestream formats")
+        local success = parse_yt(ytdl, youtube_id, opts.livestream_extractor, checks)
+        if success ~= nil and not (success and not ytdl.hls_manifest and not ytdl.dash_manifest) then
+            return success
+        else
+            msg.warn("Livestream extractor failed, using initial formats")
+            ytdl.is_live = nil
+        end
     end
     
     if json and (json.streamingData or (json.playerResponse and json.playerResponse.streamingData)) then
@@ -647,17 +661,6 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
         end
         table.sort(streaming_fields)
         msg.debug("Received streaming data: " .. table.concat(streaming_fields, ", "))
-        
-        if not checks[opts.livestream_extractor] and extractors[opts.livestream_extractor] and response.videoDetails and response.videoDetails.isLive then
-            ytdl.is_live = true
-            msg.info("Trying to get " .. opts.livestream_extractor .. " livestream formats")
-            local success = parse_yt(ytdl, youtube_id, opts.livestream_extractor, checks)
-            if success ~= nil and not (success and not ytdl.hls_manifest and not ytdl.dash_manifest) then
-                return success
-            else
-                msg.warn("Livestream extractor failed, using initial formats")
-            end
-        end
         
         if response.playabilityStatus and response.playabilityStatus.paygatedQualitiesMetadata then
             for _, quality in ipairs(response.playabilityStatus.paygatedQualitiesMetadata.qualityDetails or {}) do
@@ -1132,6 +1135,10 @@ function parse_yt(ytdl, youtube_id, extractor_name, checks, get_config, async_cb
                 if date_str then -- yt-dlp возвращает дату лишь в формате YYYYMMDD, но для отображения в интерфейсе годится дата и в человекочитаемом формате
                     ytdl.upload_date_text = date_str:gsub("Published on ", ""):gsub("Дата публикации: ", "")
                 end
+                local view_number = parse_num(try_get(element.videoDescriptionHeaderModel, "videoDescriptionHeader.viewCountText"))
+                if view_number then
+                    ytdl[ytdl.is_live and "concurrent_view_count" or "view_count"] = view_number
+                end
             elseif element.descriptionBodyModel then
                 local localized_description = clean_str(try_get(element.descriptionBodyModel, "renderer.descriptionBodyText.elementsAttributedString.content")) or ""
                 if localized_description ~= "" and ytdl.description ~= localized_description then
@@ -1335,8 +1342,9 @@ function add_storyboard_formats(ytdl, sb_spec, duration)
 end
 
 function parse_microformat(ytdl, microformat)
-    if try_get(microformat, "thumbnail.thumbnails[1].url") then -- содержит превью в лучшем доступном разрешении
-        if not ytdl.thumbnail or (ytdl.thumbnail.height or 0) < (microformat.thumbnail.thumbnails[1].height or 0) then
+    if try_get(microformat, "thumbnail.thumbnails[1].url") then -- обычно содержит превью в лучшем доступном разрешении
+        if not try_get(ytdl, "thumbnails[1]") or (ytdl.thumbnails[#ytdl.thumbnails].height or 0) < (microformat.thumbnail.thumbnails[1].height or 0) then
+            ytdl.thumbnails = ytdl.thumbnails or {}
             table.insert(ytdl.thumbnails, microformat.thumbnail.thumbnails[1])
             ytdl.thumbnails[#ytdl.thumbnails].preference = #ytdl.thumbnails
             ytdl.thumbnail = microformat.thumbnail.thumbnails[1].url
@@ -1489,7 +1497,7 @@ function populate_with_web_metadata(success, res)
         table.insert(ytdl.formats, 1, sb_fmt)
     end
     
-    local response = utils.parse_json(res.stdout)
+    local response = parse_large_json(res.stdout)
     if response and response.playabilityStatus then
         local duration = tonumber(try_get(response, "videoDetails.lengthSeconds") or "")
         if duration and try_get(response, "storyboards.playerStoryboardSpecRenderer.spec") then
@@ -1575,7 +1583,7 @@ function parse_playlist(ytdl, req_id, pl_type, noncritical)
         continuation_token = nil
         msg.debug("Playlist response length: " .. #res.stdout)
         
-        local json = utils.parse_json(res.stdout)
+        local json = parse_large_json(res.stdout)
         local videos = try_get(json, "contents.twoColumnBrowseResultsRenderer.tabs[1].tabRenderer.content.sectionListRenderer.contents[1].itemSectionRenderer.contents")
                 or try_get(json, "onResponseReceivedActions[1].appendContinuationItemsAction.continuationItems")
                 or try_get(json, "contents.twoColumnWatchNextResults.playlist.playlist.contents")
@@ -1755,7 +1763,7 @@ function parse_channel(ytdl, channel_data, resolve_iter)
     end
     msg.debug("Channel response length: " .. #res.stdout)
         
-    local json = utils.parse_json(res.stdout)
+    local json = parse_large_json(res.stdout)
     local err_type = resolve_iter>0 and "Failed to resolve channel handle" or "Channel parsing failed"
     if resolve_iter > 0 and try_get(json, "endpoint.browseEndpoint.browseId") then
         ytdl.id = json.endpoint.browseEndpoint.browseId
@@ -1809,5 +1817,30 @@ function parse_channel(ytdl, channel_data, resolve_iter)
         msg.debug("Innertube response: " .. (#res.stdout > 0 and res.stdout or "(nil)"))
     else
         report_error(err_type .. ", curl finished with error code " .. tostring(res.status))
+    end
+end
+
+
+-- далее идёт минифицированный код json-парсера json.lua
+-- оригинал: https://github.com/rxi/json.lua
+local function a()local json={_version="0.1.2"}local b;local c={["\\"]="\\",["\""]="\"",["\b"]="b",["\f"]="f",["\n"]="n",["\r"]="r",["\t"]="t"}local d={["/"]="/"}for e,f in pairs(c)do d[f]=e end;local function g(h)return"\\"..(c[h]or string.format("u%04x",h:byte()))end;local function i(j)return"null"end;local function k(j,l)local m={}l=l or{}if l[j]then error("circular reference")end;l[j]=true;if rawget(j,1)~=nil or next(j)==nil then local n=0;for e in pairs(j)do if type(e)~="number"then error("invalid table: mixed or invalid key types")end;n=n+1 end;if n~=#j then error("invalid table: sparse array")end;for o,f in ipairs(j)do table.insert(m,b(f,l))end;l[j]=nil;return"["..table.concat(m,",").."]"else for e,f in pairs(j)do if type(e)~="string"then error("invalid table: mixed or invalid key types")end;table.insert(m,b(e,l)..":"..b(f,l))end;l[j]=nil;return"{"..table.concat(m,",").."}"end end;local function p(j)return'"'..j:gsub('[%z\1-\31\\"]',g)..'"'end;local function q(j)if j~=j or j<=-math.huge or j>=math.huge then error("unexpected number value '"..tostring(j).."'")end;return string.format("%.14g",j)end;local r={["nil"]=i,["table"]=k,["string"]=p,["number"]=q,["boolean"]=tostring}b=function(j,l)local s=type(j)local t=r[s]if t then return t(j,l)end;error("unexpected type '"..s.."'")end;function json.encode(j)return b(j)end;local u;local function v(...)local m={}for o=1,select("#",...)do m[select(o,...)]=true end;return m end;local w=v(" ","\t","\r","\n")local x=v(" ","\t","\r","\n","]","}",",")local y=v("\\","/",'"',"b","f","n","r","t","u")local z=v("true","false","null")local A={["true"]=true,["false"]=false,["null"]=nil}local function B(C,D,E,F)for o=D,#C do if E[C:sub(o,o)]~=F then return o end end;return#C+1 end;local function G(C,D,H)local I=1;local J=1;for o=1,D-1 do J=J+1;if C:sub(o,o)=="\n"then I=I+1;J=1 end end;error(string.format("%s at line %d col %d",H,I,J))end;local function K(n)local t=math.floor;if n<=0x7f then return string.char(n)elseif n<=0x7ff then return string.char(t(n/64)+192,n%64+128)elseif n<=0xffff then return string.char(t(n/4096)+224,t(n%4096/64)+128,n%64+128)elseif n<=0x10ffff then return string.char(t(n/262144)+240,t(n%262144/4096)+128,t(n%4096/64)+128,n%64+128)end;error(string.format("invalid unicode codepoint '%x'",n))end;local function L(M)local N=tonumber(M:sub(1,4),16)local O=tonumber(M:sub(7,10),16)if O then return K((N-0xd800)*0x400+O-0xdc00+0x10000)else return K(N)end end;local function P(C,o)local m=""local Q=o+1;local e=Q;while Q<=#C do local R=C:byte(Q)if R<32 then G(C,Q,"control character in string")elseif R==92 then m=m..C:sub(e,Q-1)Q=Q+1;local h=C:sub(Q,Q)if h=="u"then local S=C:match("^[dD][89aAbB]%x%x\\u%x%x%x%x",Q+1)or C:match("^%x%x%x%x",Q+1)or G(C,Q-1,"invalid unicode escape in string")m=m..L(S)Q=Q+#S else if not y[h]then G(C,Q-1,"invalid escape char '"..h.."' in string")end;m=m..d[h]end;e=Q+1 elseif R==34 then m=m..C:sub(e,Q-1)return m,Q+1 end;Q=Q+1 end;G(C,o,"expected closing quote for string")end;local function T(C,o)local R=B(C,o,x)local M=C:sub(o,R-1)local n=tonumber(M)if not n then G(C,o,"invalid number '"..M.."'")end;return n,R end;local function U(C,o)local R=B(C,o,x)local V=C:sub(o,R-1)if not z[V]then G(C,o,"invalid literal '"..V.."'")end;return A[V],R end;local function W(C,o)local m={}local n=1;o=o+1;while 1 do local R;o=B(C,o,w,true)if C:sub(o,o)=="]"then o=o+1;break end;R,o=u(C,o)m[n]=R;n=n+1;o=B(C,o,w,true)local X=C:sub(o,o)o=o+1;if X=="]"then break end;if X~=","then G(C,o,"expected ']' or ','")end end;return m,o end;local function Y(C,o)local m={}o=o+1;while 1 do local Z,j;o=B(C,o,w,true)if C:sub(o,o)=="}"then o=o+1;break end;if C:sub(o,o)~='"'then G(C,o,"expected string for key")end;Z,o=u(C,o)o=B(C,o,w,true)if C:sub(o,o)~=":"then G(C,o,"expected ':' after key")end;o=B(C,o+1,w,true)j,o=u(C,o)m[Z]=j;o=B(C,o,w,true)local X=C:sub(o,o)o=o+1;if X=="}"then break end;if X~=","then G(C,o,"expected '}' or ','")end end;return m,o end;local _={['"']=P,["0"]=T,["1"]=T,["2"]=T,["3"]=T,["4"]=T,["5"]=T,["6"]=T,["7"]=T,["8"]=T,["9"]=T,["-"]=T,["t"]=U,["f"]=U,["n"]=U,["["]=W,["{"]=Y}u=function(C,D)local X=C:sub(D,D)local t=_[X]if t then return t(C,D)end;G(C,D,"unexpected character '"..X.."'")end;function json.decode(C)if type(C)~="string"then error("expected argument of type string, got "..type(C))end;local m,D=u(C,B(C,1,w,true))D=B(C,D,w,true)if D<=#C then G(C,D,"trailing garbage")end;return m end;return json end
+jsonlua = a()
+-- конец кода json.lua
+
+-- встроенный json-парсер mpv не поддерживает обработку json с уровнем вложенности дерева больше 50,
+-- которые иногда возвращает Ютуб в выдаче reel-экстракторов (в более старых версиях mpv лимит вложенности вообще всего 32)
+-- подробнее о проблеме: https://github.com/mpv-player/mpv/pull/11899
+function parse_large_json(json_str)
+    local json = utils.parse_json(json_str)
+    if json then
+        return json
+    elseif #json_str > 0 then
+        msg.debug("mpv's json parser failed, trying json.lua (#json_str = " .. #json_str .. ")")
+        local _, data = pcall(jsonlua.decode, json_str)
+        if type(data) == "table" then
+            return data
+        else
+            msg.warn("Failed to parse json: " .. (type(data) == "string" and data or "(unknown error)"))
+        end
     end
 end
