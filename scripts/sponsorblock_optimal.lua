@@ -437,7 +437,7 @@ function skip_ads(name,pos)
                     mp.set_property("time-pos",v+0.01)
                     mp.msg.info(string.format("%s auto-skipped (from %g to %g)", i.category, pos, v))
                     return
-                elseif not skip_suggested then -- уведомление о ручном пропуске (вызывается каждый кадр видео)
+                elseif not skip_suggested and not (notice_data.skipped and (v - pos) < 0.5) then -- уведомление о ручном пропуске (вызывается каждый кадр видео)
                     skip_suggested = true
                     if not notice_active or notice_data ~= i then
                         if not fade_out_timer:is_enabled() then
@@ -656,10 +656,17 @@ function file_loaded()
         end
 
         if ranges then
-            mp.msg.info("Received", #ranges, "sponsored segments")
-            ranges_cache[youtube_id] = ranges
-            enable()
-            return
+            local video_dur = mp.get_property_number("duration") or 0
+            if video_dur > 0 and ranges[1] and (ranges[1].videoDuration or 0) > 0 and math.abs(ranges[1].videoDuration - video_dur) > 1.5 then
+                -- такое может быть, когда скрипт загружает сегменты для скачанного yt-dlp ролика (по ссылке благодаря --embed-metadata),
+                -- но реклама уже была вырезана из видеофайла с помощью --sponsorblock-remove, из-за чего сегменты съехались
+                mp.msg.warn("Video duration mismatch with database - segments may be misaligned and were discarded")
+            else
+                mp.msg.info("Received", #ranges, "sponsored segments")
+                ranges_cache[youtube_id] = ranges
+                enable()
+                return
+            end
         end
     end
         
@@ -670,7 +677,9 @@ function file_loaded()
     elseif not sponsors.killed_by_us then
         local err = "Unable to fetch SponsorBlock segments" .. (sponsors.status == 28 and " (network timeout)" or "")
         mp.msg.error(err .. ((sponsors.stdout ~= "" and sponsors.stdout ~= "000") and (", HTTP code: " .. sponsors.stdout) or ""))
-        mp.osd_message(is_rus and "Не удалось получить сегменты SponsorBlock" .. (sponsors.status == 28 and " (таймаут сети)" or "") or err)
+        if video_path:match("^%w+://") then
+            mp.osd_message(is_rus and "Не удалось получить сегменты SponsorBlock" .. (sponsors.status == 28 and " (таймаут сети)" or "") or err)
+        end
         mp.msg.debug(string.format("curl status: %d, received data: %s", sponsors.status or -1, #response > 0 and response or "(nil)"))
         youtube_id = ""
     end
